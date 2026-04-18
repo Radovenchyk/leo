@@ -260,6 +260,7 @@ pub fn get_consensus_version(
         Some(12) => Ok(ConsensusVersion::V12),
         Some(13) => Ok(ConsensusVersion::V13),
         Some(14) => Ok(ConsensusVersion::V14),
+        Some(15) => Ok(ConsensusVersion::V15),
         // If none is provided, then attempt to query the current block height and use it to determine the version.
         None => {
             println!("Attempting to determine the consensus version from the latest block height at {endpoint}...");
@@ -343,7 +344,7 @@ pub fn number_to_consensus_version(index: usize) -> Result<ConsensusVersion> {
         11 => Ok(ConsensusVersion::V11),
         12 => Ok(ConsensusVersion::V12),
         13 => Ok(ConsensusVersion::V13),
-        14 => Ok(ConsensusVersion::V14),
+        14 => Ok(ConsensusVersion::V15),
         _ => Err(CliError::custom(format!(
             "Invalid consensus version: {index}. You may need to update Leo to support this version."
         ))
@@ -463,6 +464,6 @@ mod test {
 
     #[test]
     fn test_latest_consensus_version() {
-        assert_eq!(ConsensusVersion::latest(), ConsensusVersion::V14); // If this fails, update the test and any code that matches on `ConsensusVersion`.
+        assert_eq!(ConsensusVersion::latest(), ConsensusVersion::V15); // If this fails, update the test and any code that matches on `ConsensusVersion`.
     }
 }

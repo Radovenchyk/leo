@@ -1,0 +1,33 @@
+program test.aleo;
+
+record Token:
+    owner as address.private;
+    amount as u64.private;
+
+function mint_and_select:
+    input r0 as boolean.private;
+    input r1 as u64.private;
+    input r2 as u64.private;
+    cast self.signer r1 into r3 as Token.record;
+    cast self.signer r2 into r4 as Token.record;
+    ternary r0 r3.owner r4.owner into r5;
+    ternary r0 r3.amount r4.amount into r6;
+    cast r5 r6 into r7 as Token.record;
+    output r7 as Token.record;
+
+constructor:
+    assert.eq edition 0u16;
+status: success
+output: {
+  owner: aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px.private,
+  amount: 5u64.private,
+  _nonce: 3590507263080877370793882830961569998292918972576886644028863696282673004952group.public,
+  _version: 1u8.public
+}
+status: success
+output: {
+  owner: aleo1rhgdu77hgyqd3xjj8ucu3jj9r2krwz6mnzyd80gncr5fxcwlh5rsvzp9px.private,
+  amount: 50u64.private,
+  _nonce: 3590507263080877370793882830961569998292918972576886644028863696282673004952group.public,
+  _version: 1u8.public
+}

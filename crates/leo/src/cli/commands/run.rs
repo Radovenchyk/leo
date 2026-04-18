@@ -251,7 +251,7 @@ fn handle_run<A: Aleo>(
         command.inputs.into_iter().map(|string| parse_input(&string, &private_key)).collect::<Result<Vec<_>>>()?;
 
     // Initialize an RNG.
-    let rng = &mut rand::thread_rng();
+    let rng = &mut rand::rng();
 
     // Initialize a new VM.
     let vm = VM::from(ConsensusStore::<A::Network, ConsensusMemory<A::Network>>::open(StorageMode::Production)?)?;

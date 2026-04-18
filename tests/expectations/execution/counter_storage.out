@@ -24,36 +24,28 @@ finalize increment:
     get.or_use counter__[false] 0u32 into r1;
     cast true r1 into r2 as Optional__EsDmm5O6sv6;
     cast false 0u32 into r3 as Optional__EsDmm5O6sv6;
-    ternary r0 r2.is_some r3.is_some into r4;
-    ternary r0 r2.val r3.val into r5;
-    cast r4 r5 into r6 as Optional__EsDmm5O6sv6;
-    contains counter__[false] into r7;
-    get.or_use counter__[false] 0u32 into r8;
-    cast true r8 into r9 as Optional__EsDmm5O6sv6;
-    cast false 0u32 into r10 as Optional__EsDmm5O6sv6;
-    ternary r7 r9.is_some r10.is_some into r11;
-    ternary r7 r9.val r10.val into r12;
-    cast r11 r12 into r13 as Optional__EsDmm5O6sv6;
-    ternary r6.is_some r13.val 0u32 into r14;
-    add r14 1u32 into r15;
-    set r15 into counter__[false];
-    contains counter__[false] into r16;
-    get.or_use counter__[false] 0u32 into r17;
-    cast true r17 into r18 as Optional__EsDmm5O6sv6;
-    cast false 0u32 into r19 as Optional__EsDmm5O6sv6;
-    ternary r16 r18.is_some r19.is_some into r20;
-    ternary r16 r18.val r19.val into r21;
-    cast r20 r21 into r22 as Optional__EsDmm5O6sv6;
-    assert.eq r22.is_some true;
-    contains counter__[false] into r23;
-    get.or_use counter__[false] 0u32 into r24;
-    cast true r24 into r25 as Optional__EsDmm5O6sv6;
-    cast false 0u32 into r26 as Optional__EsDmm5O6sv6;
-    ternary r23 r25.is_some r26.is_some into r27;
-    ternary r23 r25.val r26.val into r28;
-    cast r27 r28 into r29 as Optional__EsDmm5O6sv6;
-    is.eq r29.val r15 into r30;
-    assert.eq r30 true;
+    ternary r0 r2 r3 into r4;
+    contains counter__[false] into r5;
+    get.or_use counter__[false] 0u32 into r6;
+    cast true r6 into r7 as Optional__EsDmm5O6sv6;
+    cast false 0u32 into r8 as Optional__EsDmm5O6sv6;
+    ternary r5 r7 r8 into r9;
+    ternary r4.is_some r9.val 0u32 into r10;
+    add r10 1u32 into r11;
+    set r11 into counter__[false];
+    contains counter__[false] into r12;
+    get.or_use counter__[false] 0u32 into r13;
+    cast true r13 into r14 as Optional__EsDmm5O6sv6;
+    cast false 0u32 into r15 as Optional__EsDmm5O6sv6;
+    ternary r12 r14 r15 into r16;
+    assert.eq r16.is_some true;
+    contains counter__[false] into r17;
+    get.or_use counter__[false] 0u32 into r18;
+    cast true r18 into r19 as Optional__EsDmm5O6sv6;
+    cast false 0u32 into r20 as Optional__EsDmm5O6sv6;
+    ternary r17 r19 r20 into r21;
+    is.eq r21.val r11 into r22;
+    assert.eq r22 true;
 
 constructor:
     assert.eq edition 0u16;
@@ -62,68 +54,20 @@ status: accepted
 {
   "transitions": [
     {
-      "id": "au1esvvuet6yfr2v8phcwkkldrhxj47sqnx0my4gzhz6mqu6844hsxqf9mggq",
+      "id": "au1pnnryx868dawasqv8n4jj7d7tx30pyqmm2c6qxvj3gd3g0qvkgysl28qvf",
       "program": "test.aleo",
       "function": "increment",
       "inputs": [],
       "outputs": [
         {
           "type": "future",
-          "id": "4123795284953306711405547114091899069262196987753907878384261664524236710246field",
+          "id": "5899740518684304282338112163986708902194566945349338765046639625353270421135field",
           "value": "{\n  program_id: test.aleo,\n  function_name: increment,\n  arguments: []\n}"
         }
       ],
-      "tpk": "5090684697494004809609624174916388033148456964301723907880593119874318900904group",
-      "tcm": "6198682801633927636307717793443826443600294542719134616850805987814675017344field",
-      "scm": "4012196251742277256059318382320629570149048681307299274211703123956785784400field"
-    }
-  ],
-  "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"
-}
-
-verified: true
-status: accepted
-{
-  "transitions": [
-    {
-      "id": "au1uq2zwhpxqdkstr7f3a0pn5lmvpplg4yvwqv320ezdm9arcwkzsqqjhsnk7",
-      "program": "test.aleo",
-      "function": "increment",
-      "inputs": [],
-      "outputs": [
-        {
-          "type": "future",
-          "id": "1657617345477423118623031663841005757020344617152125740942005887822821218262field",
-          "value": "{\n  program_id: test.aleo,\n  function_name: increment,\n  arguments: []\n}"
-        }
-      ],
-      "tpk": "5517244343701912635940692703846608447404250918415574958184958023765235540070group",
-      "tcm": "4245943680652427267274655649542589654865152892635033666372395606847838665833field",
-      "scm": "7553020108417171544204059344323771354840096576006307187987919856345933112179field"
-    }
-  ],
-  "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"
-}
-
-verified: true
-status: accepted
-{
-  "transitions": [
-    {
-      "id": "au149mh4w7n840yamjghhhvqhlgx4xvetnps53u3re0sz0p0aycpvyqlgpvwt",
-      "program": "test.aleo",
-      "function": "increment",
-      "inputs": [],
-      "outputs": [
-        {
-          "type": "future",
-          "id": "3546149719087238977991556714418934951963008933771471738551494149061970157422field",
-          "value": "{\n  program_id: test.aleo,\n  function_name: increment,\n  arguments: []\n}"
-        }
-      ],
-      "tpk": "3351678976428371433567257129076171491163488903372052830521939391837485825830group",
-      "tcm": "3333771168374803478713440908153189825205453514831664000886739204806099100416field",
-      "scm": "4864247306697103771029481339848619054919736314479157045330816786359541967532field"
+      "tpk": "8248862325563257622392415253058719806606360047877877595214998535662209862826group",
+      "tcm": "7294222546942781597122878091109925960915033056246814244533119955959445942055field",
+      "scm": "1818422294156161997668753348076769505029990921085415674925179675457431430522field"
     }
   ],
   "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"
@@ -148,6 +92,54 @@ status: accepted
       "tpk": "6167284956045805895438735587336968623492030822606066794496481825280547540189group",
       "tcm": "2885604430016418600459023961161399851504952557501553572388190934546407402245field",
       "scm": "2359187129570494229444314356630261180584616141732531697965329748168182830724field"
+    }
+  ],
+  "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"
+}
+
+verified: true
+status: accepted
+{
+  "transitions": [
+    {
+      "id": "au1r7j4c869q34dz85tqm488nfnzdj3uv5unc3pfa8eev6f48j0hgrqs94u5u",
+      "program": "test.aleo",
+      "function": "increment",
+      "inputs": [],
+      "outputs": [
+        {
+          "type": "future",
+          "id": "6956708659452537082126310429686839875290322977014728779769258323366172204792field",
+          "value": "{\n  program_id: test.aleo,\n  function_name: increment,\n  arguments: []\n}"
+        }
+      ],
+      "tpk": "3258445770054308518017217654634039393780192381454866345324274618307137343116group",
+      "tcm": "5489538648517949705322071692252284415628449579919947918520271420668962560782field",
+      "scm": "407877793531990082429966029640729858254912015197619486169264153944232655127field"
+    }
+  ],
+  "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"
+}
+
+verified: true
+status: accepted
+{
+  "transitions": [
+    {
+      "id": "au1eu9t4dgtcclhr8cvk9nnwr9j5a45pl6s4wl54g6a47p2hwp3nv9sqnrj7u",
+      "program": "test.aleo",
+      "function": "increment",
+      "inputs": [],
+      "outputs": [
+        {
+          "type": "future",
+          "id": "3855291520083478113838875974316788028572556533104669233988575557535465927511field",
+          "value": "{\n  program_id: test.aleo,\n  function_name: increment,\n  arguments: []\n}"
+        }
+      ],
+      "tpk": "7574269887715216730203316200188488324075040142270394620140178316777718115831group",
+      "tcm": "1560095877313331361423235219641894325183348165715883084449727815130356046344field",
+      "scm": "5267202169301637513038773849176165506976385567169795377359906906236336310010field"
     }
   ],
   "global_state_root": "sr1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq6gk0xu"

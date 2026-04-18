@@ -186,7 +186,7 @@ fn handle_synthesize<A: Aleo>(
     let is_local = programs.iter().any(|(program, _)| program.id() == &program_id);
 
     // Initialize an RNG.
-    let rng = &mut rand::thread_rng();
+    let rng = &mut rand::rng();
 
     // Initialize a new VM.
     let vm = VM::from(ConsensusStore::<A::Network, ConsensusMemory<A::Network>>::open(StorageMode::Production)?)?;

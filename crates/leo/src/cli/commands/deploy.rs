@@ -278,7 +278,7 @@ fn handle_deploy<N: Network, A: Aleo<Network = N>>(
     }
 
     // Initialize an RNG.
-    let rng = &mut rand::thread_rng();
+    let rng = &mut rand::rng();
 
     // Initialize a new VM.
     let vm = VM::from(ConsensusStore::<N, ConsensusMemory<N>>::open(StorageMode::Production)?)?;

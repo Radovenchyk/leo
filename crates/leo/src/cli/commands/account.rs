@@ -254,7 +254,7 @@ fn generate_new_account<N: Network>(
         // Recover the field element deterministically.
         Some(seed) => PrivateKey::<N>::new(&mut ChaChaRng::seed_from_u64(seed)),
         // Sample a random field element.
-        None => PrivateKey::new(&mut ChaChaRng::from_entropy()),
+        None => PrivateKey::new(&mut ChaChaRng::from_rng(&mut rand::rng())),
     }
     .map_err(CliError::failed_to_parse_seed)?;
 
@@ -343,7 +343,7 @@ pub(crate) fn sign_message<N: Network>(
         .map_err(|_| CliError::cli_invalid_input("Failed to parse a valid private key"))?;
 
     // Sample a random field element.
-    let mut rng = ChaChaRng::from_entropy();
+    let mut rng = ChaChaRng::from_rng(&mut rand::rng());
 
     // Sign the message
     let signature = if raw {
