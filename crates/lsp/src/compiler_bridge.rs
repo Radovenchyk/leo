@@ -92,7 +92,7 @@ use leo_span::{
     with_session_globals,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fs::Metadata,
     hash::{DefaultHasher, Hash, Hasher},
     io,
@@ -101,6 +101,8 @@ use std::{
     sync::{Arc, Mutex, atomic::Ordering},
     time::UNIX_EPOCH,
 };
+
+const MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES: usize = 8;
 
 /// Worker result for a package-analysis job.
 #[derive(Debug, Clone)]
@@ -115,6 +117,7 @@ pub struct PackageWorkerAnalysis {
 #[derive(Debug, Default)]
 pub struct PackageAnalysisCache {
     entries: HashMap<PathBuf, PackageAnalysisCacheEntry>,
+    order: VecDeque<PathBuf>,
 }
 
 /// One cached package entry, including both the imported stubs and the
@@ -242,7 +245,6 @@ fn package_analysis(
                 .get(path)
                 .cloned()
                 .or_else(|| open_buffer_fingerprint(snapshot.open_overlays.as_ref(), path))
-                .or_else(|| disk_fingerprint(path))
                 .unwrap_or(SourceFingerprint::Volatile)
         },
         |path| open_line_index(snapshot.open_overlays.as_ref(), path),
@@ -444,16 +446,6 @@ fn open_line_index(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<Arc<l
     overlays.iter().find(|overlay| overlay.path.as_ref() == path).map(|overlay| Arc::clone(&overlay.line_index))
 }
 
-fn disk_fingerprint(path: &StdPath) -> Option<SourceFingerprint> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    let stamp = std::fs::metadata(path).ok().and_then(|metadata| disk_stamp(&metadata))?;
-    Some(SourceFingerprint::Disk {
-        modified_nanos: Some(stamp.modified_nanos),
-        len: stamp.len,
-        content_hash: content_hash(contents.as_str()),
-    })
-}
-
 fn content_hash(contents: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     contents.hash(&mut hasher);
@@ -468,6 +460,7 @@ impl PackageAnalysisCache {
                 .iter()
                 .any(|bucket| matches!(bucket, AnalysisBucket::ManagedPackage { package_root: root } if root.as_ref() == package_root))
         });
+        self.order.retain(|package_root| self.entries.contains_key(package_root));
     }
 
     /// Return cached import stubs for the project, reloading them whenever the
@@ -476,7 +469,9 @@ impl PackageAnalysisCache {
         if let Some(entry) = self.entries.get_mut(project.package_root.as_ref())
             && entry.revision == watched_paths_revision_cached(entry.watch_paths.as_ref(), &mut entry.watch_state)
         {
-            return Ok(Arc::clone(&entry.import_stubs));
+            let import_stubs = Arc::clone(&entry.import_stubs);
+            self.touch_entry(project.package_root.as_ref());
+            return Ok(import_stubs);
         }
 
         // Import stubs are package-wide, but they depend on manifest/source
@@ -487,13 +482,37 @@ impl PackageAnalysisCache {
         let mut watch_state = HashMap::new();
         let revision = watched_paths_revision_cached(watch_paths.as_ref(), &mut watch_state);
         let import_stubs = Arc::new(loaded.stubs);
-        self.entries.insert(project.package_root.as_ref().clone(), PackageAnalysisCacheEntry {
+        let package_root = project.package_root.as_ref().clone();
+        self.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
             import_stubs: Arc::clone(&import_stubs),
             watch_paths,
             watch_state,
             revision,
         });
+        self.touch_entry(&package_root);
+        self.evict_old_entries(&package_root);
         Ok(import_stubs)
+    }
+
+    fn touch_entry(&mut self, package_root: &StdPath) {
+        self.order.retain(|candidate| candidate.as_path() != package_root);
+        self.order.push_back(package_root.to_path_buf());
+    }
+
+    fn evict_old_entries(&mut self, protected: &StdPath) {
+        self.order.retain(|package_root| self.entries.contains_key(package_root));
+        let mut attempts = self.order.len();
+        while self.entries.len() > MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES && attempts > 0 {
+            attempts -= 1;
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if oldest.as_path() == protected {
+                self.order.push_back(oldest);
+            } else {
+                self.entries.remove(&oldest);
+            }
+        }
     }
 }
 
@@ -1366,7 +1385,12 @@ fn collect_leo_files(dir: &StdPath, files: &mut Vec<PathBuf>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{PackageAnalysisCache, analyze_snapshot};
+    use super::{
+        MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES,
+        PackageAnalysisCache,
+        PackageAnalysisCacheEntry,
+        analyze_snapshot,
+    };
     use crate::{
         document_store::{DocumentSnapshot, DocumentStore},
         project_model::ProjectModel,
@@ -1465,6 +1489,26 @@ mod tests {
         let second = cache.import_stubs_for(project.as_ref()).expect("cached load");
 
         assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn package_cache_caps_open_stub_entries() {
+        let mut cache = PackageAnalysisCache::default();
+
+        for index in 0..(MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES + 3) {
+            let package_root = Path::new("/tmp").join(format!("pkg-{index}"));
+            cache.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
+                import_stubs: Arc::new(Default::default()),
+                watch_paths: Arc::from([]),
+                watch_state: Default::default(),
+                revision: index as u64,
+            });
+            cache.touch_entry(&package_root);
+            cache.evict_old_entries(&package_root);
+        }
+
+        assert_eq!(cache.entries.len(), MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES);
+        assert!(cache.entries.contains_key(Path::new("/tmp").join("pkg-10").as_path()));
     }
 
     #[test]

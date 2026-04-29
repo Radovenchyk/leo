@@ -22,11 +22,15 @@ use crate::{
     panic_boundary::{PanicReport, catch_unwind},
     semantics::{CachedDocumentView, CachedPackageAnalysis},
 };
-use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use lsp_types::Uri;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicU64},
+    sync::{
+        Arc,
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread::{self, JoinHandle},
 };
 
@@ -34,17 +38,8 @@ const WORKER_CHANNEL_BOUND: usize = 1;
 const MAX_PENDING_PACKAGE_JOBS: usize = 16;
 const MAX_PENDING_VIEW_JOBS: usize = 64;
 
-type PendingPackageJobs = HashMap<PackageAnalysisKey, PendingPackageJob>;
+type PendingPackageJobs = HashMap<AnalysisBucket, PendingPackageJob>;
 type PendingViewJobs = HashMap<DocumentViewKey, PendingViewJob>;
-
-/// Commands sent from the main thread to the background worker.
-#[derive(Debug)]
-pub enum WorkerCommand {
-    AnalyzePackage(DocumentSnapshot),
-    BuildDocumentView { snapshot: DocumentViewSnapshot, package: Arc<CachedPackageAnalysis> },
-    SetOpenBuckets(HashSet<AnalysisBucket>),
-    Shutdown,
-}
 
 /// Events sent from the background worker back to the main thread.
 #[derive(Debug)]
@@ -83,41 +78,77 @@ struct PendingViewJob {
     package: Arc<CachedPackageAnalysis>,
 }
 
+/// Heavy analysis jobs waiting for the worker.
+///
+/// The routing thread writes snapshots into this short-lived queue and sends a
+/// tiny wakeup over the channel. Keeping package-sized snapshots out of the
+/// channel lets edit storms coalesce in place without blocking LSP request
+/// handling behind compiler work.
+#[derive(Debug, Default)]
+struct PendingQueues {
+    packages: PendingPackageJobs,
+    views: PendingViewJobs,
+    sequence: u64,
+    open_buckets: Option<HashSet<AnalysisBucket>>,
+}
+
+#[derive(Debug)]
+enum WorkerWake {
+    Wake,
+}
+
+enum WorkerJob {
+    Package(DocumentSnapshot),
+    View(DocumentViewSnapshot, Arc<CachedPackageAnalysis>),
+}
+
 /// Background worker owner and communication channels.
 #[derive(Debug)]
 pub struct Scheduler {
-    command_tx: Sender<WorkerCommand>,
+    wake_tx: Sender<WorkerWake>,
+    event_tx: Sender<WorkerEvent>,
     event_rx: Receiver<WorkerEvent>,
+    pending: Arc<Mutex<PendingQueues>>,
+    shutdown_requested: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Scheduler {
     /// Spawn the dedicated analysis worker thread.
     pub fn new(panic_on_worker_job: bool) -> Self {
-        let (command_tx, command_rx) = bounded(WORKER_CHANNEL_BOUND);
+        let (wake_tx, wake_rx) = bounded(WORKER_CHANNEL_BOUND);
         let (event_tx, event_rx) = unbounded();
+        let pending = Arc::new(Mutex::new(PendingQueues::default()));
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+
+        let worker_pending = Arc::clone(&pending);
+        let worker_shutdown = Arc::clone(&shutdown_requested);
+        let worker_event_tx = event_tx.clone();
 
         let worker = thread::Builder::new()
             .name("leo-lsp-worker".to_owned())
-            .spawn(move || worker_loop(command_rx, event_tx, panic_on_worker_job))
+            .spawn(move || worker_loop(wake_rx, worker_event_tx, worker_pending, worker_shutdown, panic_on_worker_job))
             .expect("failed to spawn leo-lsp worker");
 
-        Self { command_tx, event_rx, worker: Some(worker) }
+        Self { wake_tx, event_tx, event_rx, pending, shutdown_requested, worker: Some(worker) }
     }
 
     /// Enqueue a document snapshot for background analysis.
     pub fn enqueue_package(&self, snapshot: DocumentSnapshot) {
-        let _ = self.command_tx.send(WorkerCommand::AnalyzePackage(snapshot));
+        with_pending_queues(&self.pending, |pending| queue_package(pending, snapshot, self.event_tx.clone()));
+        self.wake_worker();
     }
 
     /// Enqueue one document-view rebuild against an already cached package analysis.
     pub fn enqueue_document_view(&self, snapshot: DocumentViewSnapshot, package: Arc<CachedPackageAnalysis>) {
-        let _ = self.command_tx.send(WorkerCommand::BuildDocumentView { snapshot, package });
+        with_pending_queues(&self.pending, |pending| queue_view(pending, snapshot, package, self.event_tx.clone()));
+        self.wake_worker();
     }
 
     /// Inform the worker which package buckets still have open documents.
     pub fn set_open_buckets(&self, buckets: HashSet<AnalysisBucket>) {
-        let _ = self.command_tx.send(WorkerCommand::SetOpenBuckets(buckets));
+        with_pending_queues(&self.pending, |pending| pending.open_buckets = Some(buckets));
+        self.wake_worker();
     }
 
     /// Return the receiver used to observe worker events.
@@ -127,11 +158,16 @@ impl Scheduler {
 
     /// Shut down the worker thread and wait for it to exit.
     pub fn shutdown(&mut self) {
-        let _ = self.command_tx.send(WorkerCommand::Shutdown);
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.wake_worker();
 
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
+    }
+
+    fn wake_worker(&self) {
+        let _ = self.wake_tx.try_send(WorkerWake::Wake);
     }
 }
 
@@ -141,118 +177,90 @@ impl Drop for Scheduler {
     }
 }
 
-fn worker_loop(command_rx: Receiver<WorkerCommand>, event_tx: Sender<WorkerEvent>, panic_on_worker_job: bool) {
-    let mut pending_packages = PendingPackageJobs::new();
-    let mut pending_views = PendingViewJobs::new();
-    let mut sequence = 0_u64;
+fn worker_loop(
+    wake_rx: Receiver<WorkerWake>,
+    event_tx: Sender<WorkerEvent>,
+    pending: Arc<Mutex<PendingQueues>>,
+    shutdown_requested: Arc<AtomicBool>,
+    panic_on_worker_job: bool,
+) {
     let mut package_cache = PackageAnalysisCache::default();
 
     loop {
-        // Block only when there is nothing queued locally; otherwise keep
-        // draining and coalescing messages before choosing the next job.
-        if pending_packages.is_empty() && pending_views.is_empty() {
-            match command_rx.recv() {
-                Ok(command) => {
-                    if absorb_command(
-                        command,
-                        &mut pending_packages,
-                        &mut pending_views,
-                        &mut sequence,
-                        &mut package_cache,
-                        &event_tx,
-                    ) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-
-        if drain_commands(
-            &command_rx,
-            &mut pending_packages,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx,
-        ) {
+        if shutdown_requested.load(Ordering::SeqCst) {
             break;
         }
 
-        if let Some(snapshot) = take_latest_package(&mut pending_packages) {
-            run_package_job(snapshot, &event_tx, panic_on_worker_job, &mut package_cache);
-        } else if let Some((snapshot, package)) = take_latest_view(&mut pending_views) {
-            run_view_job(snapshot, package, &event_tx, panic_on_worker_job);
-        }
-    }
-}
-
-fn absorb_command(
-    command: WorkerCommand,
-    pending_packages: &mut PendingPackageJobs,
-    pending_views: &mut PendingViewJobs,
-    sequence: &mut u64,
-    package_cache: &mut PackageAnalysisCache,
-    event_tx: &Sender<WorkerEvent>,
-) -> bool {
-    match command {
-        WorkerCommand::AnalyzePackage(snapshot) => {
-            *sequence += 1;
-            if pending_packages.len() >= MAX_PENDING_PACKAGE_JOBS
-                && !pending_packages.contains_key(&snapshot.package_key)
-                && let Some(dropped) = drop_oldest_package(pending_packages)
-            {
-                let _ = event_tx.send(WorkerEvent::PackageCancelled {
-                    key: dropped.snapshot.package_key,
-                    uri: dropped.snapshot.uri,
-                    generation: dropped.snapshot.generation,
-                });
-            }
-            // Replacing by package key coalesces edit storms down to the latest
-            // heavy overlay snapshot for that package generation.
-            pending_packages.insert(snapshot.package_key.clone(), PendingPackageJob { sequence: *sequence, snapshot });
-            false
-        }
-        WorkerCommand::BuildDocumentView { snapshot, package } => {
-            *sequence += 1;
-            if pending_views.len() >= MAX_PENDING_VIEW_JOBS
-                && !pending_views.contains_key(&snapshot.key)
-                && let Some(dropped) = drop_oldest_view(pending_views)
-            {
-                let _ = event_tx.send(WorkerEvent::DocumentViewCancelled { key: dropped.snapshot.key });
-            }
-            pending_views.insert(snapshot.key.clone(), PendingViewJob { sequence: *sequence, snapshot, package });
-            false
-        }
-        WorkerCommand::SetOpenBuckets(open_buckets) => {
-            package_cache.retain_open_buckets(&open_buckets);
-            false
-        }
-        WorkerCommand::Shutdown => true,
-    }
-}
-
-fn drain_commands(
-    command_rx: &Receiver<WorkerCommand>,
-    pending_packages: &mut PendingPackageJobs,
-    pending_views: &mut PendingViewJobs,
-    sequence: &mut u64,
-    package_cache: &mut PackageAnalysisCache,
-    event_tx: &Sender<WorkerEvent>,
-) -> bool {
-    // Collapse any burst of pending commands before work starts so the worker
-    // spends time on the freshest snapshots rather than intermediate states.
-    loop {
-        match command_rx.try_recv() {
-            Ok(command) => {
-                if absorb_command(command, pending_packages, pending_views, sequence, package_cache, event_tx) {
-                    return true;
+        if let Some(job) = take_next_job(&pending, &mut package_cache) {
+            match job {
+                WorkerJob::Package(snapshot) => {
+                    run_package_job(snapshot, &event_tx, panic_on_worker_job, &mut package_cache);
                 }
+                WorkerJob::View(snapshot, package) => run_view_job(snapshot, package, &event_tx, panic_on_worker_job),
             }
-            Err(TryRecvError::Empty) => return false,
-            Err(TryRecvError::Disconnected) => return true,
+            continue;
+        }
+
+        match wake_rx.recv() {
+            Ok(WorkerWake::Wake) => {}
+            Err(_) => break,
         }
     }
+}
+
+fn with_pending_queues<R>(pending: &Arc<Mutex<PendingQueues>>, f: impl FnOnce(&mut PendingQueues) -> R) -> R {
+    let mut pending = pending.lock().expect("scheduler pending queue mutex poisoned");
+    f(&mut pending)
+}
+
+fn queue_package(pending: &mut PendingQueues, snapshot: DocumentSnapshot, event_tx: Sender<WorkerEvent>) {
+    pending.sequence += 1;
+    if pending.packages.len() >= MAX_PENDING_PACKAGE_JOBS
+        && !pending.packages.contains_key(&snapshot.package_key.bucket)
+        && let Some(dropped) = drop_oldest_package(&mut pending.packages)
+    {
+        let _ = event_tx.send(WorkerEvent::PackageCancelled {
+            key: dropped.snapshot.package_key,
+            uri: dropped.snapshot.uri,
+            generation: dropped.snapshot.generation,
+        });
+    }
+
+    // Replacing by bucket, not generation, keeps edit storms to one heavy
+    // overlay snapshot per package while preserving the freshest generation.
+    pending
+        .packages
+        .insert(snapshot.package_key.bucket.clone(), PendingPackageJob { sequence: pending.sequence, snapshot });
+}
+
+fn queue_view(
+    pending: &mut PendingQueues,
+    snapshot: DocumentViewSnapshot,
+    package: Arc<CachedPackageAnalysis>,
+    event_tx: Sender<WorkerEvent>,
+) {
+    pending.sequence += 1;
+    if pending.views.len() >= MAX_PENDING_VIEW_JOBS
+        && !pending.views.contains_key(&snapshot.key)
+        && let Some(dropped) = drop_oldest_view(&mut pending.views)
+    {
+        let _ = event_tx.send(WorkerEvent::DocumentViewCancelled { key: dropped.snapshot.key });
+    }
+    pending.views.insert(snapshot.key.clone(), PendingViewJob { sequence: pending.sequence, snapshot, package });
+}
+
+fn take_next_job(pending: &Arc<Mutex<PendingQueues>>, package_cache: &mut PackageAnalysisCache) -> Option<WorkerJob> {
+    with_pending_queues(pending, |pending| {
+        if let Some(open_buckets) = pending.open_buckets.take() {
+            package_cache.retain_open_buckets(&open_buckets);
+        }
+
+        if let Some(snapshot) = take_latest_package(&mut pending.packages) {
+            Some(WorkerJob::Package(snapshot))
+        } else {
+            take_latest_view(&mut pending.views).map(|(snapshot, package)| WorkerJob::View(snapshot, package))
+        }
+    })
 }
 
 fn take_latest_package(pending: &mut PendingPackageJobs) -> Option<DocumentSnapshot> {
@@ -372,19 +380,8 @@ fn is_cancelled(cancel_token: &AtomicU64, generation: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        PendingPackageJobs,
-        PendingViewJobs,
-        Scheduler,
-        WorkerCommand,
-        WorkerEvent,
-        absorb_command,
-        take_latest_package,
-    };
-    use crate::{
-        compiler_bridge::PackageAnalysisCache,
-        document_store::{AnalysisBucket, DocumentSnapshot, DocumentViewKey, PackageAnalysisKey},
-    };
+    use super::{PendingQueues, Scheduler, WorkerEvent, queue_package, take_latest_package};
+    use crate::document_store::{AnalysisBucket, DocumentSnapshot, DocumentViewKey, PackageAnalysisKey};
     use crossbeam_channel::unbounded;
     use line_index::LineIndex;
     use lsp_types::Uri;
@@ -426,68 +423,27 @@ mod tests {
 
     #[test]
     fn coalescing_keeps_latest_snapshot_per_uri() {
-        let mut pending = PendingPackageJobs::new();
-        let mut pending_views = PendingViewJobs::new();
-        let mut sequence = 0;
-        let mut package_cache = PackageAnalysisCache::default();
+        let mut pending = PendingQueues::default();
         let event_tx = event_sink();
         let uri = "file:///tmp/main.leo";
 
-        assert!(!absorb_command(
-            WorkerCommand::AnalyzePackage(snapshot(uri, 1)),
-            &mut pending,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx
-        ));
-        assert!(!absorb_command(
-            WorkerCommand::AnalyzePackage(snapshot(uri, 2)),
-            &mut pending,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx
-        ));
+        queue_package(&mut pending, snapshot(uri, 1), event_tx.clone());
+        queue_package(&mut pending, snapshot(uri, 2), event_tx);
 
-        let next = take_latest_package(&mut pending).expect("pending snapshot");
+        let next = take_latest_package(&mut pending.packages).expect("pending snapshot");
         assert_eq!(next.generation, 2);
     }
 
     #[test]
     fn latest_updated_document_runs_first() {
-        let mut pending = PendingPackageJobs::new();
-        let mut pending_views = PendingViewJobs::new();
-        let mut sequence = 0;
-        let mut package_cache = PackageAnalysisCache::default();
+        let mut pending = PendingQueues::default();
         let event_tx = event_sink();
 
-        assert!(!absorb_command(
-            WorkerCommand::AnalyzePackage(snapshot("file:///tmp/a.leo", 1)),
-            &mut pending,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx
-        ));
-        assert!(!absorb_command(
-            WorkerCommand::AnalyzePackage(snapshot("file:///tmp/b.leo", 1)),
-            &mut pending,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx
-        ));
-        assert!(!absorb_command(
-            WorkerCommand::AnalyzePackage(snapshot("file:///tmp/a.leo", 2)),
-            &mut pending,
-            &mut pending_views,
-            &mut sequence,
-            &mut package_cache,
-            &event_tx
-        ));
+        queue_package(&mut pending, snapshot("file:///tmp/a.leo", 1), event_tx.clone());
+        queue_package(&mut pending, snapshot("file:///tmp/b.leo", 1), event_tx.clone());
+        queue_package(&mut pending, snapshot("file:///tmp/a.leo", 2), event_tx);
 
-        let next = take_latest_package(&mut pending).expect("pending snapshot");
+        let next = take_latest_package(&mut pending.packages).expect("pending snapshot");
         assert_eq!(next.uri.as_str(), "file:///tmp/a.leo");
         assert_eq!(next.generation, 2);
     }

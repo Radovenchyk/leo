@@ -313,6 +313,8 @@ impl SemanticTokenOccurrence {
 pub struct SemanticIndex {
     /// Interned analyzed file paths.
     pub files: Arc<[Arc<PathBuf>]>,
+    /// Path-to-file lookup table sorted for binary search.
+    pub file_lookup: Arc<[(Arc<PathBuf>, FileId)]>,
     /// Interned compact symbol keys.
     pub symbol_keys: Arc<[CompactSymbolKey]>,
     /// All compact occurrences in file/source order.
@@ -388,6 +390,9 @@ impl SemanticIndex {
 
         let file_occurrence_ranges = file_occurrence_ranges(&compact_occurrences);
         let (definitions, definition_ranges) = definition_slices(definition_pairs);
+        let mut file_lookup =
+            files.iter().enumerate().map(|(id, path)| (Arc::clone(path), id as FileId)).collect::<Vec<_>>();
+        file_lookup.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         let analyzed_files = files
             .iter()
@@ -403,6 +408,7 @@ impl SemanticIndex {
         (
             Self {
                 files: Arc::from(files),
+                file_lookup: Arc::from(file_lookup),
                 symbol_keys: Arc::from(symbol_keys),
                 occurrences: Arc::from(compact_occurrences),
                 file_occurrence_ranges: Arc::from(file_occurrence_ranges),
@@ -420,10 +426,7 @@ impl SemanticIndex {
     /// position when the caret visually sits at the end of a token.
     pub fn occurrence_at(&self, path: &Path, offset: u32) -> Option<CompactOccurrenceRef<'_>> {
         let file = self.file_id(path)?;
-        let range = self
-            .file_occurrence_ranges
-            .iter()
-            .find_map(|(candidate, range)| (*candidate == file).then_some(range.clone()))?;
+        let range = self.file_occurrence_range(file)?;
 
         let mut best = None::<&CompactOccurrence>;
         for occurrence in &self.occurrences[range.start as usize..range.end as usize] {
@@ -450,9 +453,10 @@ impl SemanticIndex {
 
     /// Return all deduplicated definition targets for a compact key.
     pub fn definitions_for(&self, key: SymbolKeyId) -> &[CompactRange] {
-        let Some((_, range)) = self.definitions.iter().find(|(candidate, _)| *candidate == key) else {
+        let Ok(index) = self.definitions.binary_search_by_key(&key, |(candidate, _)| *candidate) else {
             return &[];
         };
+        let (_, range) = &self.definitions[index];
         &self.definition_ranges[range.start as usize..range.end as usize]
     }
 
@@ -461,11 +465,7 @@ impl SemanticIndex {
         let Some(file) = self.file_id(path) else {
             return Vec::new();
         };
-        let Some(range) = self
-            .file_occurrence_ranges
-            .iter()
-            .find_map(|(candidate, range)| (*candidate == file).then_some(range.clone()))
-        else {
+        let Some(range) = self.file_occurrence_range(file) else {
             return Vec::new();
         };
 
@@ -486,7 +486,13 @@ impl SemanticIndex {
 
     /// Return the compact ID for a path interned in this index.
     pub fn file_id(&self, path: &Path) -> Option<FileId> {
-        self.files.iter().position(|candidate| candidate.as_ref() == path).map(|index| index as FileId)
+        let index = self.file_lookup.binary_search_by(|(candidate, _)| candidate.as_ref().as_path().cmp(path)).ok()?;
+        Some(self.file_lookup[index].1)
+    }
+
+    fn file_occurrence_range(&self, file: FileId) -> Option<std::ops::Range<u32>> {
+        let index = self.file_occurrence_ranges.binary_search_by_key(&file, |(candidate, _)| *candidate).ok()?;
+        Some(self.file_occurrence_ranges[index].1.clone())
     }
 }
 

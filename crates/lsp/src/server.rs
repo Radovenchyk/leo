@@ -17,7 +17,7 @@
 #![allow(clippy::mutable_key_type)]
 
 use crate::{
-    document_store::{DocumentStore, DocumentViewKey, PackageAnalysisKey},
+    document_store::{AnalysisBucket, DocumentStore, DocumentViewKey, PackageAnalysisKey},
     features::{
         goto_definition::{
             DefinitionQuery,
@@ -290,13 +290,13 @@ impl ServerState {
             DID_OPEN => {
                 let params: DidOpenTextDocumentParams =
                     serde_json::from_value(notification.params).context("failed to deserialize didOpen")?;
-                self.handle_did_open(params);
+                self.handle_did_open(connection, params);
                 Ok(false)
             }
             DID_CHANGE => {
                 let params: DidChangeTextDocumentParams =
                     serde_json::from_value(notification.params).context("failed to deserialize didChange")?;
-                self.handle_did_change(params);
+                self.handle_did_change(connection, params);
                 Ok(false)
             }
             DID_CLOSE => {
@@ -318,8 +318,9 @@ impl ServerState {
         }
     }
 
-    fn handle_did_open(&mut self, params: DidOpenTextDocumentParams) {
+    fn handle_did_open(&mut self, connection: &Connection, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
+        let previous_bucket = self.documents.package_key(&document.uri).map(|key| key.bucket);
         // Resolve the package root before commit so the worker snapshot and the
         // main-thread document state observe the same project context.
         let (file_path, project) = self.project_model.resolve_document_context(&document.uri);
@@ -335,14 +336,20 @@ impl ServerState {
         self.hooks.maybe_panic_notification(DID_OPEN);
 
         let snapshot = self.documents.commit_open(prepared);
-        self.analysis.invalidate_uri(&snapshot.uri);
+        self.invalidate_bucket_for_new_snapshot(
+            connection,
+            previous_bucket.as_ref(),
+            &snapshot.package_key.bucket,
+            "package analysis was superseded",
+        );
         self.scheduler.set_open_buckets(self.documents.open_buckets());
         self.analysis.in_flight_packages.insert(snapshot.package_key.clone());
         self.scheduler.enqueue_package(snapshot);
     }
 
-    fn handle_did_change(&mut self, params: DidChangeTextDocumentParams) {
+    fn handle_did_change(&mut self, connection: &Connection, params: DidChangeTextDocumentParams) {
         let DidChangeTextDocumentParams { text_document, content_changes } = params;
+        let previous_bucket = self.documents.package_key(&text_document.uri).map(|key| key.bucket);
 
         let Some(text) = extract_full_sync_text(content_changes) else {
             return;
@@ -362,7 +369,12 @@ impl ServerState {
         self.hooks.maybe_panic_notification(DID_CHANGE);
 
         let snapshot = self.documents.commit_change(prepared);
-        self.analysis.invalidate_uri(&snapshot.uri);
+        self.invalidate_bucket_for_new_snapshot(
+            connection,
+            previous_bucket.as_ref(),
+            &snapshot.package_key.bucket,
+            "package analysis was superseded",
+        );
         self.scheduler.set_open_buckets(self.documents.open_buckets());
         self.analysis.in_flight_packages.insert(snapshot.package_key.clone());
         self.scheduler.enqueue_package(snapshot);
@@ -371,9 +383,9 @@ impl ServerState {
     fn handle_did_close(&mut self, connection: &Connection, params: DidCloseTextDocumentParams) {
         self.hooks.maybe_panic_notification(DID_CLOSE);
         let uri = params.text_document.uri;
+        let previous_bucket = self.documents.package_key(&uri).map(|key| key.bucket);
         self.documents.close(&uri);
         self.scheduler.set_open_buckets(self.documents.open_buckets());
-        self.analysis.invalidate_uri(&uri);
         if let Err(error) =
             send_ok_responses(connection, self.semantic_token_requests.clear_uri(&uri), empty_response_value())
         {
@@ -381,6 +393,12 @@ impl ServerState {
         }
         if let Err(error) = send_definition_nulls(connection, self.definition_requests.clear_uri(&uri)) {
             tracing::error!(uri = uri.as_str(), error = %error, "failed to flush definition close responses");
+        }
+        if let Some(bucket) = previous_bucket {
+            self.analysis.invalidate_bucket(&bucket);
+            self.cancel_pending_bucket_requests(connection, &bucket, "package analysis was superseded");
+        } else {
+            self.analysis.invalidate_uri(&uri);
         }
     }
 
@@ -661,6 +679,50 @@ impl ServerState {
         }
     }
 
+    fn invalidate_bucket_for_new_snapshot(
+        &mut self,
+        connection: &Connection,
+        previous_bucket: Option<&AnalysisBucket>,
+        current_bucket: &AnalysisBucket,
+        message: &'static str,
+    ) {
+        if let Some(previous_bucket) = previous_bucket
+            && previous_bucket != current_bucket
+        {
+            self.analysis.invalidate_bucket(previous_bucket);
+            self.cancel_pending_bucket_requests(connection, previous_bucket, message);
+        }
+        self.analysis.invalidate_bucket(current_bucket);
+        self.cancel_pending_bucket_requests(connection, current_bucket, message);
+    }
+
+    fn cancel_pending_bucket_requests(
+        &mut self,
+        connection: &Connection,
+        bucket: &AnalysisBucket,
+        message: &'static str,
+    ) {
+        if let Err(error) = send_error_responses(
+            connection,
+            self.semantic_token_requests.take_bucket(bucket),
+            ErrorCode::RequestCanceled as i32,
+            format!("semantic token {message}"),
+        ) {
+            tracing::error!(error = %error, "failed to cancel semantic token bucket waiters");
+        }
+
+        let definition_requests =
+            self.definition_requests.take_bucket(bucket).into_iter().map(|pending| pending.id).collect();
+        if let Err(error) = send_error_responses(
+            connection,
+            definition_requests,
+            ErrorCode::RequestCanceled as i32,
+            format!("definition {message}"),
+        ) {
+            tracing::error!(error = %error, "failed to cancel definition bucket waiters");
+        }
+    }
+
     fn cancel_pending_package_requests(
         &mut self,
         connection: &Connection,
@@ -710,6 +772,16 @@ impl AnalysisCaches {
         self.document_views.remove(uri);
         self.failed_views.retain(|key| &key.uri != uri);
         self.in_flight_views.retain(|key| &key.uri != uri);
+    }
+
+    fn invalidate_bucket(&mut self, bucket: &AnalysisBucket) {
+        self.packages.retain(|key, _| &key.bucket != bucket);
+        self.package_order.retain(|key| &key.bucket != bucket);
+        self.failed_packages.retain(|key| &key.bucket != bucket);
+        self.in_flight_packages.retain(|key| &key.bucket != bucket);
+        self.document_views.retain(|_, view| &view.key.package.bucket != bucket);
+        self.failed_views.retain(|key| &key.package.bucket != bucket);
+        self.in_flight_views.retain(|key| &key.package.bucket != bucket);
     }
 
     fn document_view(&self, key: &DocumentViewKey) -> Option<&CachedDocumentView> {
@@ -772,6 +844,11 @@ impl SemanticTokenRequestState {
 
     fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<RequestId> {
         let keys = self.keys_for_package(package);
+        keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
+    }
+
+    fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<RequestId> {
+        let keys = self.pending_by_key.keys().filter(|key| &key.package.bucket == bucket).cloned().collect::<Vec<_>>();
         keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
     }
 
@@ -838,6 +915,12 @@ impl DefinitionRequestState {
             self.pending_owner.remove(&request.id);
         }
         requests
+    }
+
+    fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingDefinitionRequest> {
+        let packages =
+            self.pending_by_package.keys().filter(|package| &package.bucket == bucket).cloned().collect::<Vec<_>>();
+        packages.into_iter().flat_map(|package| self.take_package(&package)).collect()
     }
 }
 
@@ -1004,7 +1087,7 @@ mod tests {
         VersionedTextDocumentIdentifier,
     };
     use serde_json::{Value, json};
-    use std::{fs, path::Path, process::ExitCode, thread, time::Duration};
+    use std::{fs, path::Path, process::ExitCode, sync::Arc, thread, time::Duration};
     use tempfile::tempdir;
 
     fn spawn_server(hooks: TestHooks) -> (Connection, thread::JoinHandle<anyhow::Result<ExitCode>>) {
@@ -1082,6 +1165,32 @@ mod tests {
             None,
         ));
         state.analysis.invalidate_uri(uri);
+    }
+
+    #[test]
+    fn bucket_invalidation_evicts_package_views_and_state() {
+        let mut state = test_state();
+        let uri: Uri = "untitled:main.leo".parse().expect("uri");
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let key = state.documents.document_view_key(&uri).expect("document view key");
+
+        state.analysis.document_views.insert(uri.clone(), crate::semantics::CachedDocumentView {
+            key: key.clone(),
+            encoded_tokens: Arc::from([]),
+        });
+        state.analysis.failed_packages.insert(key.package.clone());
+        state.analysis.in_flight_packages.insert(key.package.clone());
+        state.analysis.failed_views.insert(key.clone());
+        state.analysis.in_flight_views.insert(key.clone());
+
+        state.analysis.invalidate_bucket(&key.package.bucket);
+
+        assert!(state.analysis.document_views.is_empty());
+        assert!(state.analysis.failed_packages.is_empty());
+        assert!(state.analysis.in_flight_packages.is_empty());
+        assert!(state.analysis.failed_views.is_empty());
+        assert!(state.analysis.in_flight_views.is_empty());
+        state.scheduler.shutdown();
     }
 
     fn initialize(client: &Connection) {
@@ -1302,8 +1411,9 @@ mod tests {
             client_definition_link_support: false,
             hooks: TestHooks::default(),
         };
+        let (server, _client) = Connection::memory();
 
-        state.handle_did_open(DidOpenTextDocumentParams {
+        state.handle_did_open(&server, DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
                 uri: uri.clone(),
                 language_id: "leo".to_owned(),
@@ -1326,7 +1436,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        state.handle_did_change(DidChangeTextDocumentParams {
+        state.handle_did_change(&server, DidChangeTextDocumentParams {
             text_document: VersionedTextDocumentIdentifier { uri: uri.clone(), version: 2 },
             content_changes: vec![TextDocumentContentChangeEvent {
                 range: None,
