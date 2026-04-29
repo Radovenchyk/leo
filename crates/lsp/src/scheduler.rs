@@ -41,7 +41,9 @@ const MAX_PENDING_PACKAGE_JOBS: usize = 16;
 /// Hard cap for lightweight document-view rebuilds waiting behind the worker.
 const MAX_PENDING_VIEW_JOBS: usize = 64;
 
+/// Pending heavy-analysis jobs keyed by package bucket.
 type PendingPackageJobs = HashMap<AnalysisBucket, PendingPackageJob>;
+/// Pending document-view jobs keyed by exact view freshness.
 type PendingViewJobs = HashMap<DocumentViewKey, PendingViewJob>;
 
 /// Events sent from the background worker back to the main thread.
@@ -81,14 +83,20 @@ pub struct PackageAnalysis {
 /// global recency so the freshest package edit runs first.
 #[derive(Debug)]
 struct PendingPackageJob {
+    /// Monotonic enqueue order used to pick the freshest job globally.
     sequence: u64,
+    /// Latest package snapshot retained for this bucket.
     snapshot: DocumentSnapshot,
 }
 
+/// A coalesced document-view job paired with its arrival order.
 #[derive(Debug)]
 struct PendingViewJob {
+    /// Monotonic enqueue order used to pick the freshest view job globally.
     sequence: u64,
+    /// Document snapshot used to rebuild encoded semantic tokens.
     snapshot: DocumentViewSnapshot,
+    /// Package analysis the document view merges against.
     package: Arc<CachedPackageAnalysis>,
 }
 
@@ -105,19 +113,28 @@ struct PendingViewJob {
 /// not serialized behind package analysis.
 #[derive(Debug, Default)]
 struct PendingQueues {
+    /// Coalesced package-analysis jobs.
     packages: PendingPackageJobs,
+    /// Coalesced document-view jobs.
     views: PendingViewJobs,
+    /// Global sequence counter shared by both queues.
     sequence: u64,
+    /// Latest open-bucket set supplied by the routing thread for cache eviction.
     open_buckets: Option<HashSet<AnalysisBucket>>,
 }
 
+/// Bounded worker wake token.
 #[derive(Debug)]
 enum WorkerWake {
+    /// Ask the worker to inspect `PendingQueues`.
     Wake,
 }
 
+/// Concrete job selected from the coalescing queues.
 enum WorkerJob {
+    /// Rebuild shared package analysis for a snapshot.
     Package(DocumentSnapshot),
+    /// Rebuild one encoded document view from a cached package.
     View(DocumentViewSnapshot, Arc<CachedPackageAnalysis>),
 }
 
@@ -185,6 +202,7 @@ impl Scheduler {
         }
     }
 
+    /// Wake the worker without queueing duplicate wake tokens.
     fn wake_worker(&self) {
         // The bounded wake channel carries no payload beyond "check the queue".
         // If it is already full, the worker has either been woken or will wake
@@ -194,11 +212,13 @@ impl Scheduler {
 }
 
 impl Drop for Scheduler {
+    /// Join the worker thread when callers drop the scheduler without explicit shutdown.
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
+/// Run the worker event loop until shutdown or channel disconnect.
 fn worker_loop(
     wake_rx: Receiver<WorkerWake>,
     event_tx: Sender<WorkerEvent>,
@@ -230,6 +250,7 @@ fn worker_loop(
     }
 }
 
+/// Mutate pending queue state while keeping the mutex critical section explicit.
 fn with_pending_queues<R>(pending: &Arc<Mutex<PendingQueues>>, f: impl FnOnce(&mut PendingQueues) -> R) -> R {
     // Keep the critical section explicit and tiny. Callers should mutate queue
     // metadata here, then do compiler or document-view work after the guard is
@@ -238,6 +259,7 @@ fn with_pending_queues<R>(pending: &Arc<Mutex<PendingQueues>>, f: impl FnOnce(&m
     f(&mut pending)
 }
 
+/// Insert or replace the pending heavy-analysis job for a package bucket.
 fn queue_package(pending: &mut PendingQueues, snapshot: DocumentSnapshot, event_tx: Sender<WorkerEvent>) {
     pending.sequence += 1;
     if pending.packages.len() >= MAX_PENDING_PACKAGE_JOBS
@@ -258,12 +280,15 @@ fn queue_package(pending: &mut PendingQueues, snapshot: DocumentSnapshot, event_
         .insert(snapshot.package_key.bucket.clone(), PendingPackageJob { sequence: pending.sequence, snapshot });
 }
 
+/// Insert or replace the pending document-view job for an exact view key.
 fn queue_view(
     pending: &mut PendingQueues,
     snapshot: DocumentViewSnapshot,
     package: Arc<CachedPackageAnalysis>,
     event_tx: Sender<WorkerEvent>,
 ) {
+    // Document views are small, but still bounded because every pending view
+    // retains a package `Arc` and an open-document snapshot.
     pending.sequence += 1;
     if pending.views.len() >= MAX_PENDING_VIEW_JOBS
         && !pending.views.contains_key(&snapshot.key)
@@ -274,6 +299,7 @@ fn queue_view(
     pending.views.insert(snapshot.key.clone(), PendingViewJob { sequence: pending.sequence, snapshot, package });
 }
 
+/// Remove the freshest runnable job and apply any queued cache-retention update.
 fn take_next_job(pending: &Arc<Mutex<PendingQueues>>, package_cache: &mut PackageAnalysisCache) -> Option<WorkerJob> {
     with_pending_queues(pending, |pending| {
         if let Some(open_buckets) = pending.open_buckets.take() {
@@ -290,16 +316,19 @@ fn take_next_job(pending: &Arc<Mutex<PendingQueues>>, package_cache: &mut Packag
     })
 }
 
+/// Remove the newest package job across all buckets.
 fn take_latest_package(pending: &mut PendingPackageJobs) -> Option<DocumentSnapshot> {
     let next_sequence = pending.values().max_by_key(|job| job.sequence)?.sequence;
     pending.extract_if(|_, job| job.sequence == next_sequence).next().map(|(_, job)| job.snapshot)
 }
 
+/// Remove the newest document-view job across all view keys.
 fn take_latest_view(pending: &mut PendingViewJobs) -> Option<(DocumentViewSnapshot, Arc<CachedPackageAnalysis>)> {
     let next_sequence = pending.values().max_by_key(|job| job.sequence)?.sequence;
     pending.extract_if(|_, job| job.sequence == next_sequence).next().map(|(_, job)| (job.snapshot, job.package))
 }
 
+/// Drop the oldest pending package job when the queue exceeds its cap.
 fn drop_oldest_package(pending: &mut PendingPackageJobs) -> Option<PendingPackageJob> {
     if let Some(oldest) = pending.iter().min_by_key(|(_, job)| job.sequence).map(|(key, _)| key.clone()) {
         return pending.remove(&oldest);
@@ -307,6 +336,7 @@ fn drop_oldest_package(pending: &mut PendingPackageJobs) -> Option<PendingPackag
     None
 }
 
+/// Drop the oldest pending view job when the queue exceeds its cap.
 fn drop_oldest_view(pending: &mut PendingViewJobs) -> Option<PendingViewJob> {
     if let Some(oldest) = pending.iter().min_by_key(|(_, job)| job.sequence).map(|(key, _)| key.clone()) {
         return pending.remove(&oldest);
@@ -314,6 +344,7 @@ fn drop_oldest_view(pending: &mut PendingViewJobs) -> Option<PendingViewJob> {
     None
 }
 
+/// Execute one package-analysis job inside the worker panic/cancellation boundary.
 fn run_package_job(
     snapshot: DocumentSnapshot,
     event_tx: &Sender<WorkerEvent>,
@@ -364,6 +395,7 @@ fn run_package_job(
     }
 }
 
+/// Execute one document-view rebuild inside the worker panic/cancellation boundary.
 fn run_view_job(
     snapshot: DocumentViewSnapshot,
     package: Arc<CachedPackageAnalysis>,
@@ -399,6 +431,7 @@ fn run_view_job(
     }
 }
 
+/// Return whether a snapshot generation has been superseded for its URI.
 fn is_cancelled(cancel_token: &AtomicU64, generation: u64) -> bool {
     // The token stores the latest committed generation for a URI, so any
     // mismatch means newer document state has superseded this snapshot.
@@ -418,10 +451,12 @@ mod tests {
         time::Duration,
     };
 
+    /// Build a test snapshot whose cancel token initially matches its generation.
     fn snapshot(uri: &str, generation: u64) -> DocumentSnapshot {
         snapshot_with_token(uri, generation, Arc::new(AtomicU64::new(generation)))
     }
 
+    /// Build a test snapshot with an explicit cancellation token.
     fn snapshot_with_token(uri: &str, generation: u64, cancel_token: Arc<AtomicU64>) -> DocumentSnapshot {
         let uri = uri.parse::<Uri>().expect("valid uri");
         let bucket = AnalysisBucket::UnmanagedDocument { uri: uri.clone() };
@@ -443,11 +478,13 @@ mod tests {
         }
     }
 
+    /// Return a worker-event sender whose receiver is intentionally unused.
     fn event_sink() -> crossbeam_channel::Sender<WorkerEvent> {
         let (tx, _rx) = unbounded();
         tx
     }
 
+    /// Verifies per-bucket package job coalescing keeps only the latest snapshot.
     #[test]
     fn coalescing_keeps_latest_snapshot_per_uri() {
         let mut pending = PendingQueues::default();
@@ -461,6 +498,7 @@ mod tests {
         assert_eq!(next.generation, 2);
     }
 
+    /// Verifies global freshness ordering runs the most recently updated package first.
     #[test]
     fn latest_updated_document_runs_first() {
         let mut pending = PendingQueues::default();
@@ -475,6 +513,7 @@ mod tests {
         assert_eq!(next.generation, 2);
     }
 
+    /// Verifies a stale package snapshot is cancelled before expensive work begins.
     #[test]
     fn stale_snapshot_is_cancelled_before_work_starts() {
         let mut scheduler = Scheduler::new(false);

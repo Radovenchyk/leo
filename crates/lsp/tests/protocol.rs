@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use std::{fs, path::Path, time::Duration};
 use tempfile::tempdir;
 
+/// Send the initialize request and return the raw response for protocol assertions.
 fn initialize(server: &mut TestServer) -> Value {
     // Tests assert on the raw initialize response, so this helper stops before
     // sending the follow-up `initialized` notification.
@@ -36,6 +37,7 @@ fn initialize(server: &mut TestServer) -> Value {
     )
 }
 
+/// Build a test `file:` URI from a native path.
 fn file_uri(path: &Path) -> Uri {
     #[cfg(target_os = "windows")]
     let path = format!("/{}", path.display()).replace('\\', "/");
@@ -46,6 +48,7 @@ fn file_uri(path: &Path) -> Uri {
     format!("file://{path}").parse().expect("file uri")
 }
 
+/// Return the LSP position for the selected occurrence of a source substring.
 fn position_json(source: &str, needle: &str, occurrence: usize) -> Value {
     let offset = source
         .match_indices(needle)
@@ -57,6 +60,7 @@ fn position_json(source: &str, needle: &str, occurrence: usize) -> Value {
     json!({ "line": line, "character": (offset - line_start) as u32 })
 }
 
+/// Return the LSP range for the selected occurrence of a source substring.
 fn range_json(source: &str, needle: &str, occurrence: usize) -> Value {
     let start = source
         .match_indices(needle)
@@ -72,6 +76,7 @@ fn range_json(source: &str, needle: &str, occurrence: usize) -> Value {
     json!({ "start": position(start), "end": position(end) })
 }
 
+/// Verifies initialize, shutdown, and exit follow the LSP lifecycle.
 #[test]
 fn initialize_shutdown_exit_round_trip() {
     let mut server = TestServer::spawn(&[]);
@@ -118,6 +123,7 @@ fn initialize_shutdown_exit_round_trip() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies go-to-definition returns a local variable declaration target.
 #[test]
 fn definition_returns_local_variable_declaration() {
     let tempdir = tempdir().expect("tempdir");
@@ -191,6 +197,7 @@ fn definition_returns_local_variable_declaration() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies go-to-definition resolves function, type, and member targets.
 #[test]
 fn definition_resolves_function_type_and_member_targets() {
     let tempdir = tempdir().expect("tempdir");
@@ -269,6 +276,7 @@ fn definition_resolves_function_type_and_member_targets() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies go-to-definition can target saved local dependency sources.
 #[test]
 fn definition_resolves_saved_local_source_dependency_target() {
     let tempdir = tempdir().expect("tempdir");
@@ -370,6 +378,7 @@ fn definition_resolves_saved_local_source_dependency_target() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies exit before shutdown returns a nonzero process status.
 #[test]
 fn exit_without_shutdown_returns_nonzero() {
     let mut server = TestServer::spawn(&[]);
@@ -382,6 +391,7 @@ fn exit_without_shutdown_returns_nonzero() {
     assert!(!status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies malformed open/change/close payloads do not kill the server.
 #[test]
 fn malformed_open_change_close_lifecycle_stays_alive() {
     let tempdir = tempdir().expect("tempdir");
@@ -445,6 +455,7 @@ fn malformed_open_change_close_lifecycle_stays_alive() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies malformed notifications are contained and logged.
 #[test]
 fn malformed_notification_payload_stays_alive() {
     let mut server = TestServer::spawn(&[]);
@@ -462,6 +473,7 @@ fn malformed_notification_payload_stays_alive() {
     assert!(stderr.contains("failed to handle client notification"), "stderr:\n{stderr}");
 }
 
+/// Verifies semantic tokens return data and reuse the cached snapshot.
 #[test]
 fn semantic_tokens_full_returns_tokens_and_reuses_cached_snapshot() {
     let tempdir = tempdir().expect("tempdir");
@@ -556,6 +568,7 @@ fn semantic_tokens_full_returns_tokens_and_reuses_cached_snapshot() {
     assert!(status.success(), "stderr:\n{stderr}");
 }
 
+/// Verifies worker panics surface as internal semantic-token errors.
 #[test]
 fn semantic_tokens_full_returns_internal_error_after_worker_panic() {
     let mut server = TestServer::spawn(&[("LEO_LSP_TEST_PANIC_WORKER", "1")]);

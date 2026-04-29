@@ -61,20 +61,34 @@ use std::{
     sync::Arc,
 };
 
+/// JSON-RPC code for internal server errors.
 const INTERNAL_ERROR: i32 = -32603;
+/// JSON-RPC code for unsupported LSP methods.
 const METHOD_NOT_FOUND: i32 = -32601;
 
+/// LSP initialized notification method.
 const INITIALIZED: &str = "initialized";
+/// LSP process-exit notification method.
 const EXIT: &str = "exit";
+/// LSP shutdown request method.
 const SHUTDOWN: &str = "shutdown";
+/// LSP open-document notification method.
 const DID_OPEN: &str = "textDocument/didOpen";
+/// LSP full-document change notification method.
 const DID_CHANGE: &str = "textDocument/didChange";
+/// LSP close-document notification method.
 const DID_CLOSE: &str = "textDocument/didClose";
+/// LSP request-cancellation notification method.
 const CANCEL_REQUEST: &str = "$/cancelRequest";
+/// LSP semantic-token request method.
 const SEMANTIC_TOKENS_FULL: &str = "textDocument/semanticTokens/full";
+/// LSP go-to-definition request method.
 const TEXT_DOCUMENT_DEFINITION: &str = "textDocument/definition";
+/// Maximum package analyses retained on the routing thread.
 const MAX_PACKAGE_CACHE_ENTRIES: usize = 8;
+/// Maximum pending go-to-definition requests across all packages.
 const MAX_PENDING_DEFINITIONS: usize = 128;
+/// Maximum pending go-to-definition requests waiting on one package key.
 const MAX_PENDING_DEFINITIONS_PER_KEY: usize = 16;
 
 /// In-memory state for one running `leo-lsp` server instance.
@@ -138,14 +152,18 @@ struct DefinitionRequestState {
 /// One pending definition request with its own cursor query preserved.
 #[derive(Debug, Clone)]
 struct PendingDefinitionRequest {
+    /// Original LSP request ID to answer once package analysis is available.
     id: RequestId,
+    /// Cursor and freshness state captured when the request arrived.
     query: DefinitionQuery,
 }
 
+/// Run the production LSP server with hooks loaded from the process environment.
 pub(crate) fn run(connection: Connection) -> Result<ExitCode> {
     run_with_hooks(connection, TestHooks::from_env())
 }
 
+/// Run the initialized server loop with optional test fault-injection hooks.
 fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> {
     let (request_id, params) = connection.initialize_start()?;
     let initialize_params: InitializeParams =
@@ -207,6 +225,7 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
 }
 
 impl ServerState {
+    /// Route one inbound LSP message to request, notification, or response handling.
     fn handle_message(&mut self, connection: &Connection, message: Message) -> Result<bool> {
         match message {
             Message::Request(request) => {
@@ -221,6 +240,7 @@ impl ServerState {
         }
     }
 
+    /// Handle an LSP request inside a panic boundary that can still answer the client.
     fn handle_request(&mut self, connection: &Connection, request: Request) -> Result<()> {
         let Request { id: request_id, method, params } = request;
 
@@ -238,6 +258,7 @@ impl ServerState {
         }
     }
 
+    /// Dispatch a deserialized request by method name.
     fn dispatch_request(
         &mut self,
         connection: &Connection,
@@ -269,6 +290,7 @@ impl ServerState {
         }
     }
 
+    /// Handle an LSP notification inside a logging-only panic boundary.
     fn handle_notification(&mut self, connection: &Connection, notification: Notification) -> Result<bool> {
         let method = notification.method.clone();
 
@@ -291,6 +313,7 @@ impl ServerState {
         }
     }
 
+    /// Dispatch a deserialized notification by method name.
     fn dispatch_notification(&mut self, connection: &Connection, notification: Notification) -> Result<bool> {
         match notification.method.as_str() {
             INITIALIZED => Ok(false),
@@ -329,6 +352,7 @@ impl ServerState {
         }
     }
 
+    /// Commit an opened document, invalidate its package bucket, and enqueue analysis.
     fn handle_did_open(&mut self, connection: &Connection, params: DidOpenTextDocumentParams) {
         let document = params.text_document;
         let previous_bucket = self.documents.package_key(&document.uri).map(|key| key.bucket);
@@ -358,6 +382,7 @@ impl ServerState {
         self.scheduler.enqueue_package(snapshot);
     }
 
+    /// Commit a full-document change and refresh package ownership before analysis.
     fn handle_did_change(&mut self, connection: &Connection, params: DidChangeTextDocumentParams) {
         let DidChangeTextDocumentParams { text_document, content_changes } = params;
         let previous_bucket = self.documents.package_key(&text_document.uri).map(|key| key.bucket);
@@ -391,6 +416,7 @@ impl ServerState {
         self.scheduler.enqueue_package(snapshot);
     }
 
+    /// Close a document and flush or cancel any waiters tied to its bucket.
     fn handle_did_close(&mut self, connection: &Connection, params: DidCloseTextDocumentParams) {
         self.hooks.maybe_panic_notification(DID_CLOSE);
         let uri = params.text_document.uri;
@@ -413,6 +439,7 @@ impl ServerState {
         }
     }
 
+    /// Remove a pending semantic-token or definition request by LSP request ID.
     fn handle_cancel_request(&mut self, connection: &Connection, params: CancelParams) -> Result<()> {
         let request_id = request_id_from_cancel(params.id);
         if self.semantic_token_requests.remove_pending_request(&request_id) {
@@ -434,6 +461,7 @@ impl ServerState {
         }
     }
 
+    /// Apply one worker event to caches and answer any pending client requests.
     fn handle_worker_event(&mut self, connection: &Connection, event: WorkerEvent) {
         match event {
             WorkerEvent::PackageAnalyzed(PackageAnalysis { uri, generation, key, result }) => {
@@ -538,6 +566,7 @@ impl ServerState {
         }
     }
 
+    /// Answer or queue one full semantic-token request.
     fn handle_semantic_tokens_full(
         &mut self,
         connection: &Connection,
@@ -567,6 +596,7 @@ impl ServerState {
         Ok(())
     }
 
+    /// Answer or queue one go-to-definition request.
     fn handle_goto_definition(
         &mut self,
         connection: &Connection,
@@ -630,6 +660,7 @@ impl ServerState {
         }
     }
 
+    /// Ensure the package and document-view analysis needed for a token request is queued.
     fn ensure_analysis_for_view(&mut self, view_key: &DocumentViewKey) {
         if let Some(package) = self.analysis.packages.get(&view_key.package).cloned() {
             self.ensure_document_view(view_key, package);
@@ -638,6 +669,7 @@ impl ServerState {
         }
     }
 
+    /// Queue package analysis unless the exact package key is cached or in flight.
     fn ensure_package_analysis(&mut self, package_key: &PackageAnalysisKey, uri: &Uri) {
         if self.analysis.in_flight_packages.contains(package_key) || self.analysis.packages.contains_key(package_key) {
             return;
@@ -649,6 +681,7 @@ impl ServerState {
         self.scheduler.enqueue_package(snapshot);
     }
 
+    /// Queue a document-view rebuild against a cached package analysis.
     fn ensure_document_view(&mut self, view_key: &DocumentViewKey, package: Arc<CachedPackageAnalysis>) {
         if self.analysis.in_flight_views.contains(view_key) || self.analysis.document_view(view_key).is_some() {
             return;
@@ -660,6 +693,7 @@ impl ServerState {
         self.scheduler.enqueue_document_view(snapshot, package);
     }
 
+    /// Cache an encoded document view and answer matching semantic-token waiters.
     fn store_document_view(&mut self, connection: &Connection, view: CachedDocumentView) {
         let key = view.key.clone();
         let uri = key.uri.clone();
@@ -672,6 +706,7 @@ impl ServerState {
         }
     }
 
+    /// Resolve all queued definition requests waiting on one package analysis.
     fn answer_pending_definitions(&mut self, connection: &Connection, key: &PackageAnalysisKey) {
         let Some(package) = self.analysis.packages.get(key).cloned() else {
             return;
@@ -687,6 +722,7 @@ impl ServerState {
         }
     }
 
+    /// Start document-view jobs unblocked by a newly cached package analysis.
     fn enqueue_pending_document_views_for_package(&mut self, key: &PackageAnalysisKey) {
         let Some(package) = self.analysis.packages.get(key).cloned() else {
             return;
@@ -697,6 +733,7 @@ impl ServerState {
         }
     }
 
+    /// Invalidate stale analysis state when a document enters a new package snapshot.
     fn invalidate_bucket_for_new_snapshot(
         &mut self,
         connection: &Connection,
@@ -717,6 +754,7 @@ impl ServerState {
         self.cancel_pending_bucket_requests(connection, current_bucket, message);
     }
 
+    /// Cancel semantic-token and definition waiters tied to one analysis bucket.
     fn cancel_pending_bucket_requests(
         &mut self,
         connection: &Connection,
@@ -744,6 +782,7 @@ impl ServerState {
         }
     }
 
+    /// Cancel semantic-token and definition waiters tied to one package key.
     fn cancel_pending_package_requests(
         &mut self,
         connection: &Connection,
@@ -771,6 +810,7 @@ impl ServerState {
         }
     }
 
+    /// Cancel semantic-token waiters tied to one document-view key.
     fn cancel_pending_document_view_requests(
         &mut self,
         connection: &Connection,
@@ -789,12 +829,14 @@ impl ServerState {
 }
 
 impl AnalysisCaches {
+    /// Remove URI-local document-view state after close or reclassification.
     fn invalidate_uri(&mut self, uri: &Uri) {
         self.document_views.remove(uri);
         self.failed_views.retain(|key| &key.uri != uri);
         self.in_flight_views.retain(|key| &key.uri != uri);
     }
 
+    /// Remove all package and document-view state for one analysis bucket.
     fn invalidate_bucket(&mut self, bucket: &AnalysisBucket) {
         self.packages.retain(|key, _| &key.bucket != bucket);
         self.package_order.retain(|key| &key.bucket != bucket);
@@ -805,10 +847,12 @@ impl AnalysisCaches {
         self.in_flight_views.retain(|key| &key.package.bucket != bucket);
     }
 
+    /// Return a cached document view only when the embedded key still matches.
     fn document_view(&self, key: &DocumentViewKey) -> Option<&CachedDocumentView> {
         self.document_views.get(&key.uri).filter(|view| &view.key == key)
     }
 
+    /// Store a package analysis and enforce the routing-thread LRU cap.
     fn store_package(&mut self, package: Arc<CachedPackageAnalysis>) {
         self.failed_packages.remove(&package.key);
         if !self.packages.contains_key(&package.key) {
@@ -826,6 +870,7 @@ impl AnalysisCaches {
         }
     }
 
+    /// Remember that current package analysis failed so repeated requests fail fast.
     fn store_failed_package(&mut self, key: PackageAnalysisKey) {
         self.failed_packages.retain(|failed| failed.bucket != key.bucket);
         self.failed_packages.insert(key);
@@ -833,11 +878,13 @@ impl AnalysisCaches {
 }
 
 impl SemanticTokenRequestState {
+    /// Queue a semantic-token waiter for an exact document-view key.
     fn queue(&mut self, key: DocumentViewKey, request_id: RequestId) {
         self.pending_by_key.entry(key.clone()).or_default().push(request_id.clone());
         self.pending_owner.insert(request_id, key);
     }
 
+    /// Remove one pending semantic-token request by request ID.
     fn remove_pending_request(&mut self, request_id: &RequestId) -> bool {
         let Some(key) = self.pending_owner.remove(request_id) else {
             return false;
@@ -851,11 +898,13 @@ impl SemanticTokenRequestState {
         true
     }
 
+    /// Drain every semantic-token waiter for a closed URI.
     fn clear_uri(&mut self, uri: &Uri) -> Vec<RequestId> {
         let keys = self.pending_by_key.keys().filter(|key| &key.uri == uri).cloned().collect::<Vec<_>>();
         keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
     }
 
+    /// Drain every semantic-token waiter for an exact document-view key.
     fn take_key(&mut self, key: &DocumentViewKey) -> Vec<RequestId> {
         let Some(requests) = self.pending_by_key.remove(key) else {
             return Vec::new();
@@ -866,22 +915,26 @@ impl SemanticTokenRequestState {
         requests
     }
 
+    /// Drain every semantic-token waiter blocked on one package key.
     fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<RequestId> {
         let keys = self.keys_for_package(package);
         keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
     }
 
+    /// Drain every semantic-token waiter blocked on one analysis bucket.
     fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<RequestId> {
         let keys = self.pending_by_key.keys().filter(|key| &key.package.bucket == bucket).cloned().collect::<Vec<_>>();
         keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
     }
 
+    /// Return document-view keys waiting on one package key.
     fn keys_for_package(&self, package: &PackageAnalysisKey) -> Vec<DocumentViewKey> {
         self.pending_by_key.keys().filter(|key| &key.package == package).cloned().collect()
     }
 }
 
 impl DefinitionRequestState {
+    /// Queue a definition request, enforcing global and per-package caps.
     fn queue(&mut self, query: DefinitionQuery, request_id: RequestId) -> bool {
         // Definition requests are cheap individually but can otherwise pile up
         // behind one slow package analysis. Cap both global and per-package
@@ -899,6 +952,7 @@ impl DefinitionRequestState {
         true
     }
 
+    /// Remove one pending definition request by request ID.
     fn remove_pending_request(&mut self, request_id: &RequestId) -> Option<PendingDefinitionRequest> {
         let package = self.pending_owner.remove(request_id)?;
         let queue = self.pending_by_package.get_mut(&package)?;
@@ -910,6 +964,7 @@ impl DefinitionRequestState {
         Some(pending)
     }
 
+    /// Drain definition requests whose source document has closed.
     fn clear_uri(&mut self, uri: &Uri) -> Vec<PendingDefinitionRequest> {
         let packages = self.pending_by_package.keys().cloned().collect::<Vec<_>>();
         let mut cleared = Vec::new();
@@ -934,6 +989,7 @@ impl DefinitionRequestState {
         cleared
     }
 
+    /// Drain definition requests waiting on one package key.
     fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<PendingDefinitionRequest> {
         let Some(requests) = self.pending_by_package.remove(package) else {
             return Vec::new();
@@ -944,6 +1000,7 @@ impl DefinitionRequestState {
         requests
     }
 
+    /// Drain definition requests waiting on any package key in a bucket.
     fn take_bucket(&mut self, bucket: &AnalysisBucket) -> Vec<PendingDefinitionRequest> {
         let packages =
             self.pending_by_package.keys().filter(|package| &package.bucket == bucket).cloned().collect::<Vec<_>>();
@@ -951,6 +1008,7 @@ impl DefinitionRequestState {
     }
 }
 
+/// Collect initialize-time workspace roots using LSP's preferred fallback order.
 #[allow(deprecated)]
 fn collect_workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
     let mut roots = Vec::new();
@@ -970,6 +1028,7 @@ fn collect_workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
     roots
 }
 
+/// Advertise the LSP capabilities implemented by this server.
 fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Options(TextDocumentSyncOptions {
@@ -985,6 +1044,7 @@ fn server_capabilities() -> ServerCapabilities {
     }
 }
 
+/// Return whether the client can consume rich `LocationLink` definition results.
 fn client_supports_definition_links(params: &InitializeParams) -> bool {
     params
         .capabilities
@@ -995,6 +1055,7 @@ fn client_supports_definition_links(params: &InitializeParams) -> bool {
         .unwrap_or(false)
 }
 
+/// Extract the committed text from a full-sync `didChange` payload.
 fn extract_full_sync_text(changes: Vec<TextDocumentContentChangeEvent>) -> Option<String> {
     if changes.is_empty() {
         tracing::warn!("didChange arrived without content changes");
@@ -1011,6 +1072,7 @@ fn extract_full_sync_text(changes: Vec<TextDocumentContentChangeEvent>) -> Optio
     changes.into_iter().next_back().map(|change| change.text)
 }
 
+/// Convert LSP's string-or-number cancellation ID into `lsp_server::RequestId`.
 fn request_id_from_cancel(id: NumberOrString) -> RequestId {
     match id {
         NumberOrString::Number(number) => number.into(),
@@ -1018,12 +1080,14 @@ fn request_id_from_cancel(id: NumberOrString) -> RequestId {
     }
 }
 
+/// Send one successful JSON-RPC response.
 fn send_ok_response(connection: &Connection, id: RequestId, result: Value) -> Result<()> {
     let response = Response { id, result: Some(result), error: None };
     connection.sender.send(Message::Response(response))?;
     Ok(())
 }
 
+/// Send one JSON-RPC error response.
 fn send_error_response(connection: &Connection, id: RequestId, code: i32, message: impl Into<String>) -> Result<()> {
     let response =
         Response { id, result: None, error: Some(ResponseError { code, message: message.into(), data: None }) };
@@ -1040,6 +1104,7 @@ fn send_ok_responses(connection: &Connection, request_ids: Vec<RequestId>, resul
     Ok(())
 }
 
+/// Send successful `null` definition responses for requests orphaned by close.
 fn send_definition_nulls(connection: &Connection, requests: Vec<PendingDefinitionRequest>) -> Result<()> {
     for request in requests {
         // A close means the source document no longer exists from the client's
@@ -1072,12 +1137,16 @@ fn send_error_responses(
 /// dispatch code the binary uses, rather than a parallel test-only harness.
 #[derive(Debug, Clone, Default)]
 struct TestHooks {
+    /// Request method that should panic when dispatched.
     panic_on_request_method: Option<String>,
+    /// Notification method that should panic when dispatched.
     panic_on_notification_method: Option<String>,
+    /// Whether every worker job should panic under test.
     panic_on_worker_job: bool,
 }
 
 impl TestHooks {
+    /// Build test hooks from environment variables used by subprocess tests.
     fn from_env() -> Self {
         Self {
             panic_on_request_method: std::env::var("LEO_LSP_TEST_PANIC_REQUEST").ok(),
@@ -1089,12 +1158,14 @@ impl TestHooks {
         }
     }
 
+    /// Panic when the configured request method is dispatched.
     fn maybe_panic_request(&self, method: &str) {
         if self.panic_on_request_method.as_deref() == Some(method) {
             panic!("injected request panic for {method}");
         }
     }
 
+    /// Panic when the configured notification method is dispatched.
     fn maybe_panic_notification(&self, method: &str) {
         if self.panic_on_notification_method.as_deref() == Some(method) {
             panic!("injected notification panic for {method}");
@@ -1121,6 +1192,7 @@ mod tests {
     use std::{fs, path::Path, process::ExitCode, sync::Arc, thread, time::Duration};
     use tempfile::tempdir;
 
+    /// Spawn the real server loop over an in-memory transport.
     fn spawn_server(hooks: TestHooks) -> (Connection, thread::JoinHandle<anyhow::Result<ExitCode>>) {
         // Use an in-memory transport so these tests exercise the real server
         // event loop without paying the cost of subprocess management.
@@ -1129,6 +1201,7 @@ mod tests {
         (client, handle)
     }
 
+    /// Build a test `file:` URI from a native path.
     fn file_uri(path: &Path) -> Uri {
         #[cfg(target_os = "windows")]
         let path = format!("/{}", path.display()).replace('\\', "/");
@@ -1139,6 +1212,7 @@ mod tests {
         format!("file://{path}").parse().expect("file uri")
     }
 
+    /// Send a JSON-RPC request frame to the in-memory server.
     fn send_request(client: &Connection, id: i32, method: &str, params: Value) {
         client
             .sender
@@ -1146,6 +1220,7 @@ mod tests {
             .expect("send request");
     }
 
+    /// Send a JSON-RPC notification frame to the in-memory server.
     fn send_notification(client: &Connection, method: &str, params: Value) {
         client
             .sender
@@ -1153,6 +1228,7 @@ mod tests {
             .expect("send notification");
     }
 
+    /// Receive the next server response in tests with a short timeout.
     fn recv_response(client: &Connection) -> Response {
         // Requests in this module are strictly request/response, so the next
         // frame observed from the server must be the matching response.
@@ -1162,6 +1238,7 @@ mod tests {
         }
     }
 
+    /// Build semantic-token request params for a document URI.
     fn semantic_tokens_params(uri: Uri) -> SemanticTokensParams {
         SemanticTokensParams {
             work_done_progress_params: Default::default(),
@@ -1170,6 +1247,7 @@ mod tests {
         }
     }
 
+    /// Build isolated server state for direct state-machine tests.
     fn test_state() -> super::ServerState {
         super::ServerState {
             shutdown_requested: false,
@@ -1186,6 +1264,7 @@ mod tests {
         }
     }
 
+    /// Insert an unmanaged open document into direct state-machine tests.
     fn open_unmanaged_document(state: &mut super::ServerState, uri: &Uri, version: i32, text: &str) {
         state.documents.commit_open(state.documents.prepare_open(
             uri.clone(),
@@ -1198,6 +1277,7 @@ mod tests {
         state.analysis.invalidate_uri(uri);
     }
 
+    /// Verifies bucket invalidation clears every package and view cache surface.
     #[test]
     fn bucket_invalidation_evicts_package_views_and_state() {
         let mut state = test_state();
@@ -1224,6 +1304,7 @@ mod tests {
         state.scheduler.shutdown();
     }
 
+    /// Complete the initialize/initialized handshake for server-loop tests.
     fn initialize(client: &Connection) {
         send_request(
             client,
@@ -1241,6 +1322,7 @@ mod tests {
         send_notification(client, "initialized", json!({}));
     }
 
+    /// Verifies exiting before shutdown reports an unsuccessful server exit.
     #[test]
     fn exit_without_shutdown_returns_failure() {
         let (client, handle) = spawn_server(TestHooks::default());
@@ -1252,6 +1334,7 @@ mod tests {
         assert_eq!(exit_code, ExitCode::from(1));
     }
 
+    /// Verifies notification panics are contained in the real server loop.
     #[test]
     fn notification_panic_can_be_tested_without_shelling_out() {
         let hooks = TestHooks { panic_on_notification_method: Some(DID_CHANGE.to_owned()), ..Default::default() };
@@ -1298,6 +1381,7 @@ mod tests {
         assert_eq!(exit_code, ExitCode::SUCCESS);
     }
 
+    /// Verifies cancelling a queued semantic-token request returns request-cancelled.
     #[test]
     fn cancelled_semantic_request_returns_request_cancelled() {
         let (server, client) = Connection::memory();
@@ -1320,6 +1404,7 @@ mod tests {
         state.scheduler.shutdown();
     }
 
+    /// Verifies worker cancellation fails semantic-token waiters for that package.
     #[test]
     fn cancelled_package_analysis_fails_pending_waiters() {
         let (server, client) = Connection::memory();
@@ -1345,6 +1430,7 @@ mod tests {
         state.scheduler.shutdown();
     }
 
+    /// Verifies a current worker panic fails pending and repeated requests.
     #[test]
     fn current_generation_worker_panic_fails_pending_and_future_requests() {
         let (server, client) = Connection::memory();
@@ -1384,6 +1470,7 @@ mod tests {
         state.scheduler.shutdown();
     }
 
+    /// Verifies stale worker panics do not poison newer pending requests.
     #[test]
     fn stale_worker_panic_does_not_fail_newer_pending_request() {
         let (server, client) = Connection::memory();
@@ -1419,6 +1506,7 @@ mod tests {
         state.scheduler.shutdown();
     }
 
+    /// Verifies didChange re-runs project discovery before queueing analysis.
     #[test]
     fn did_change_re_resolves_project_context() {
         let tempdir = tempdir().expect("tempdir");

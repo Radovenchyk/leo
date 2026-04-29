@@ -503,6 +503,7 @@ impl SemanticIndex {
         Some(self.file_lookup[index].1)
     }
 
+    /// Return the contiguous occurrence slice for one interned file.
     fn file_occurrence_range(&self, file: FileId) -> Option<std::ops::Range<u32>> {
         let index = self.file_occurrence_ranges.binary_search_by_key(&file, |(candidate, _)| *candidate).ok()?;
         Some(self.file_occurrence_ranges[index].1.clone())
@@ -546,6 +547,7 @@ pub struct SemanticSnapshot {
     pub source: SemanticSource,
 }
 
+/// Intern a path and return the compact file ID used by ranges.
 fn intern_file(
     path: &Arc<PathBuf>,
     path_ids: &mut HashMap<Arc<PathBuf>, FileId>,
@@ -560,10 +562,12 @@ fn intern_file(
     id
 }
 
+/// Convert a path-bearing range into an ID-bearing compact range.
 fn compact_range(range: &FileRange, path_ids: &HashMap<Arc<PathBuf>, FileId>) -> Option<CompactRange> {
     Some(CompactRange { file: *path_ids.get(&range.path)?, start: range.start, end: range.end })
 }
 
+/// Lower a build-time symbol key into the compact cached representation.
 fn compact_symbol_key(key: SymbolKey, path_ids: &HashMap<Arc<PathBuf>, FileId>) -> Option<CompactSymbolKey> {
     match key {
         SymbolKey::Local { declaration } => {
@@ -575,6 +579,7 @@ fn compact_symbol_key(key: SymbolKey, path_ids: &HashMap<Arc<PathBuf>, FileId>) 
     }
 }
 
+/// Intern a compact symbol key and return its stable package-local ID.
 fn intern_symbol_key(
     key: CompactSymbolKey,
     key_ids: &mut HashMap<CompactSymbolKey, SymbolKeyId>,
@@ -589,6 +594,7 @@ fn intern_symbol_key(
     id
 }
 
+/// Build per-file slices after occurrences have been sorted by file and range.
 fn file_occurrence_ranges(occurrences: &[CompactOccurrence]) -> Vec<(FileId, std::ops::Range<u32>)> {
     let mut ranges = Vec::new();
     let mut start = 0_usize;
@@ -604,6 +610,7 @@ fn file_occurrence_ranges(occurrences: &[CompactOccurrence]) -> Vec<(FileId, std
     ranges
 }
 
+/// Build compact definition lookup tables from `(key, target)` pairs.
 fn definition_slices(
     mut pairs: Vec<(SymbolKeyId, CompactRange)>,
 ) -> (Vec<(SymbolKeyId, std::ops::Range<u32>)>, Vec<CompactRange>) {
@@ -633,6 +640,7 @@ fn definition_slices(
     (definitions, ranges)
 }
 
+/// Return a compact range length, saturating defensively for malformed inputs.
 fn range_len(range: CompactRange) -> u32 {
     range.end.saturating_sub(range.start)
 }
@@ -697,6 +705,7 @@ mod tests {
     use super::{FileRange, OccurrenceRole, SemanticKind, SymbolIdentity, SymbolOccurrence, merge_occurrences};
     use std::{path::PathBuf, sync::Arc};
 
+    /// Build a minimal occurrence for merge-order unit tests.
     fn occurrence(path: &Arc<PathBuf>, start: u32, end: u32, token_kind: SemanticKind) -> SymbolOccurrence {
         SymbolOccurrence {
             range: FileRange::new(Arc::clone(path), start, end).expect("non-empty range"),
@@ -707,6 +716,7 @@ mod tests {
         }
     }
 
+    /// Verifies compiler occurrences win exact range conflicts with syntax fallback.
     #[test]
     fn merge_occurrences_prefers_compiler_occurrences_on_exact_range_conflicts() {
         let path = Arc::new(PathBuf::from("main.leo"));
@@ -723,6 +733,7 @@ mod tests {
         assert!(merged[0].readonly);
     }
 
+    /// Verifies merged occurrences are returned in stable source order.
     #[test]
     fn merge_occurrences_returns_source_ordered_output() {
         let a_path = Arc::new(PathBuf::from("a.leo"));

@@ -357,6 +357,7 @@ impl DocumentStore {
 }
 
 impl OpenDocument {
+    /// Capture the current open document plus package context for worker analysis.
     fn snapshot(
         &self,
         uri: Uri,
@@ -383,6 +384,7 @@ impl OpenDocument {
 }
 
 impl PreparedDocument {
+    /// Split a prepared mutation into its target URI and committed document state.
     fn into_parts(self) -> (Uri, OpenDocument) {
         let Self { uri, document } = self;
         (uri, document)
@@ -390,6 +392,7 @@ impl PreparedDocument {
 }
 
 impl DocumentStore {
+    /// Build the package-analysis freshness key for a bucket.
     fn package_key_for_bucket(&self, bucket: &AnalysisBucket) -> PackageAnalysisKey {
         PackageAnalysisKey {
             bucket: bucket.clone(),
@@ -397,11 +400,13 @@ impl DocumentStore {
         }
     }
 
+    /// Advance a bucket generation after any open-buffer input changes.
     fn bump_bucket(&mut self, bucket: &AnalysisBucket) {
         let generation = self.bucket_generations.get(bucket).copied().unwrap_or_default();
         self.bucket_generations.insert(bucket.clone(), next_generation(generation));
     }
 
+    /// Collect open same-bucket buffers that compiler package analysis may read.
     fn open_overlays(&self, bucket: &AnalysisBucket) -> Arc<[OpenFileOverlay]> {
         let overlays = self
             .documents
@@ -436,6 +441,7 @@ impl DocumentStore {
     }
 }
 
+/// Choose the invalidation bucket for a document based on project discovery.
 fn analysis_bucket_for(uri: &Uri, project: Option<&Arc<ProjectContext>>) -> AnalysisBucket {
     match project {
         Some(project) => AnalysisBucket::ManagedPackage { package_root: Arc::clone(&project.package_root) },
@@ -443,6 +449,7 @@ fn analysis_bucket_for(uri: &Uri, project: Option<&Arc<ProjectContext>>) -> Anal
     }
 }
 
+/// Return the next monotonic generation, panicking rather than wrapping.
 fn next_generation(generation: u64) -> u64 {
     // Generation reuse would break stale-work detection, so overflow is treated
     // as a hard invariant violation rather than wrapping silently.
@@ -456,10 +463,12 @@ mod tests {
     use lsp_types::Uri;
     use std::sync::{Arc, atomic::Ordering};
 
+    /// Return the canonical URI used by document-store unit tests.
     fn test_uri() -> Uri {
         "file:///tmp/main.leo".parse().expect("valid file uri")
     }
 
+    /// Verifies full-sync edits replace text and advance document generations.
     #[test]
     fn full_sync_replaces_text_and_increments_generation() {
         let mut store = DocumentStore::default();
@@ -478,6 +487,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.line_index, &second.line_index));
     }
 
+    /// Verifies prepared-but-uncommitted edits do not mutate visible state.
     #[test]
     fn dropping_prepared_change_preserves_committed_state() {
         let mut store = DocumentStore::default();
@@ -495,6 +505,7 @@ mod tests {
         assert_eq!(current.cancel_token.load(Ordering::SeqCst), 1);
     }
 
+    /// Verifies closing a document invalidates snapshots already sent to workers.
     #[test]
     fn close_invalidates_in_flight_work() {
         let mut store = DocumentStore::default();
@@ -508,6 +519,7 @@ mod tests {
         assert!(store.generation(&uri).is_none());
     }
 
+    /// Verifies reopening a URI cannot reuse its closed generation.
     #[test]
     fn reopen_after_close_advances_generation() {
         let mut store = DocumentStore::default();
@@ -524,6 +536,7 @@ mod tests {
         assert_eq!(second.generation, 2);
     }
 
+    /// Verifies duplicate opens cancel work tied to the replaced document.
     #[test]
     fn duplicate_open_invalidates_previous_in_flight_work() {
         let mut store = DocumentStore::default();
@@ -540,6 +553,7 @@ mod tests {
         assert_eq!(second.cancel_token.load(Ordering::SeqCst), 2);
     }
 
+    /// Verifies line indices preserve UTF-16 columns for multibyte text.
     #[test]
     fn line_index_tracks_utf16_columns_for_multibyte_text() {
         let mut store = DocumentStore::default();

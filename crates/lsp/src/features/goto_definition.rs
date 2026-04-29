@@ -135,6 +135,7 @@ pub fn response_value(result: DefinitionResult) -> Value {
     }
 }
 
+/// Convert a source occurrence range in the requesting open buffer to LSP coordinates.
 fn compact_range_to_open_lsp_range(
     range: CompactRange,
     package: &CachedPackageAnalysis,
@@ -147,6 +148,7 @@ fn compact_range_to_open_lsp_range(
     byte_range_to_lsp_range(line_index, range.start, range.end)
 }
 
+/// Convert a compact definition target into a safe external URI/range pair.
 fn compact_range_to_location_parts(range: CompactRange, package: &CachedPackageAnalysis) -> Option<(Uri, Range)> {
     let file = package.analyzed_files.get(range.file)?;
     let uri = path_to_file_uri(file.path.as_ref())?;
@@ -167,6 +169,7 @@ fn compact_range_to_location_parts(range: CompactRange, package: &CachedPackageA
     Some((uri, lsp_range))
 }
 
+/// Convert UTF-8 byte offsets into the UTF-16 positions required by LSP.
 fn byte_range_to_lsp_range(line_index: &LineIndex, start: u32, end: u32) -> Option<Range> {
     let start = line_index.try_line_col(TextSize::from(start))?;
     let end = line_index.try_line_col(TextSize::from(end))?;
@@ -175,6 +178,7 @@ fn byte_range_to_lsp_range(line_index: &LineIndex, start: u32, end: u32) -> Opti
     Some(Range::new(Position::new(start.line, start.col), Position::new(end.line, end.col)))
 }
 
+/// Re-read disk text only when it still matches the analysis fingerprint.
 fn read_verified_disk_text(path: &Path, expected: &SourceFingerprint) -> Option<String> {
     let SourceFingerprint::Disk { modified_nanos, len, content_hash } = expected else {
         return None;
@@ -191,6 +195,7 @@ fn read_verified_disk_text(path: &Path, expected: &SourceFingerprint) -> Option<
     Some(text)
 }
 
+/// Hash text using the same lightweight process-local hasher as analysis.
 fn hash_text(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);

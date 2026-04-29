@@ -55,6 +55,7 @@ pub(crate) fn collect_view(snapshot: &DocumentViewSnapshot) -> SyntaxSemantics {
     collect_parts(snapshot.text.as_ref(), snapshot.file_path.as_ref(), snapshot.project.as_ref())
 }
 
+/// Shared collection path for package-analysis and document-view snapshots.
 fn collect_parts(
     text: &str,
     file_path: Option<&Arc<PathBuf>>,
@@ -103,7 +104,9 @@ fn current_document_path(file_path: Option<&Arc<PathBuf>>) -> Arc<PathBuf> {
 /// Syntax parser mode used by the fallback highlighter.
 #[derive(Debug, Clone, Copy)]
 enum SyntaxParser {
+    /// Parse a file that may contain a full `program` declaration.
     Main,
+    /// Parse a package module or library source file.
     Module,
 }
 
@@ -222,7 +225,9 @@ impl SyntaxSemanticCollector {
 /// Minimal binding metadata for syntax-only local reference highlighting.
 #[derive(Debug, Clone, Copy)]
 struct SyntaxLocalBinding {
+    /// Token kind originally assigned to the local declaration.
     token_kind: SemanticKind,
+    /// Whether references should inherit the readonly modifier.
     readonly: bool,
 }
 
@@ -427,6 +432,7 @@ mod tests {
     use std::{fs, path::Path};
     use tempfile::tempdir;
 
+    /// Build a test `file:` URI from a native path.
     fn file_uri(path: &Path) -> Uri {
         #[cfg(target_os = "windows")]
         let path = {
@@ -441,6 +447,7 @@ mod tests {
         format!("file://{path}").parse().expect("file uri")
     }
 
+    /// Build a committed document snapshot for syntax fallback tests.
     fn snapshot_for(path: &Path, text: &str) -> DocumentSnapshot {
         let uri = file_uri(path);
         let mut projects = ProjectModel::default();
@@ -449,6 +456,7 @@ mod tests {
         documents.commit_open(documents.prepare_open(uri, "leo".to_owned(), 1, text.to_owned(), file_path, project))
     }
 
+    /// Verifies unmanaged buffers get syntax symbols and lexical token coverage.
     #[test]
     fn unmanaged_program_buffers_emit_symbols_and_full_lexical_coverage() {
         let tempdir = tempdir().expect("tempdir");

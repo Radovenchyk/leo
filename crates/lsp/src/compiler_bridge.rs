@@ -103,6 +103,7 @@ use std::{
     time::UNIX_EPOCH,
 };
 
+/// Maximum worker-local dependency-stub packages retained at once.
 const MAX_PACKAGE_ANALYSIS_CACHE_ENTRIES: usize = 8;
 
 /// Worker result for a package-analysis job.
@@ -252,6 +253,7 @@ pub fn build_document_view(snapshot: &DocumentViewSnapshot, package: Arc<CachedP
     CachedDocumentView { key: snapshot.key.clone(), encoded_tokens }
 }
 
+/// Lower merged occurrences into a shared package index and trigger-document view.
 fn package_analysis(
     snapshot: &DocumentSnapshot,
     occurrences: Vec<SymbolOccurrence>,
@@ -397,10 +399,12 @@ struct RecordingFileSource {
 }
 
 impl RecordingFileSource {
+    /// Create a recording file source over the open buffers captured by a snapshot.
     fn new(overlays: Arc<[OpenFileOverlay]>) -> Self {
         Self { overlays, fingerprints: RefCell::new(HashMap::new()) }
     }
 
+    /// Return a compact, deterministic copy of dependency fingerprints for cache storage.
     fn dependency_fingerprints(&self) -> Arc<[(PathBuf, SourceFingerprint)]> {
         let mut fingerprints = self
             .fingerprints
@@ -415,6 +419,7 @@ impl RecordingFileSource {
         Arc::from(fingerprints)
     }
 
+    /// Merge cached dependency fingerprints with reads performed by this job.
     fn fingerprints_with(&self, cached: &[(PathBuf, SourceFingerprint)]) -> HashMap<PathBuf, SourceFingerprint> {
         let recorded = self.fingerprints.borrow();
         let mut fingerprints = HashMap::with_capacity(cached.len() + recorded.len());
@@ -423,12 +428,14 @@ impl RecordingFileSource {
         fingerprints
     }
 
+    /// Record the fingerprint for bytes returned through this file source.
     fn record(&self, path: &StdPath, fingerprint: SourceFingerprint) {
         self.fingerprints.borrow_mut().insert(path.to_path_buf(), fingerprint);
     }
 }
 
 impl FileSource for RecordingFileSource {
+    /// Read a source file from an open overlay or disk and capture its fingerprint.
     fn read_file(&self, path: &StdPath) -> io::Result<String> {
         if let Some(overlay) = self.overlays.iter().find(|overlay| overlay.path.as_ref() == path) {
             let text = overlay.text.to_string();
@@ -454,6 +461,7 @@ impl FileSource for RecordingFileSource {
         Ok(contents)
     }
 
+    /// List package source modules, including unsaved open overlays.
     fn list_leo_files(&self, dir: &StdPath, exclude: &StdPath) -> io::Result<Vec<PathBuf>> {
         let mut files = DiskFileSource.list_leo_files(dir, exclude)?;
         for overlay in self.overlays.iter() {
@@ -472,16 +480,21 @@ impl FileSource for RecordingFileSource {
     }
 }
 
+/// Cheap filesystem stamp used to prove a disk read was stable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DiskStamp {
+    /// File length observed in metadata.
     len: u64,
+    /// Last-modified timestamp converted to nanoseconds since the Unix epoch.
     modified_nanos: u128,
 }
 
+/// Build a comparable stamp from filesystem metadata.
 fn disk_stamp(metadata: &Metadata) -> Option<DiskStamp> {
     Some(DiskStamp { len: metadata.len(), modified_nanos: metadata_modified_nanos(metadata)? })
 }
 
+/// Fingerprint an analyzed open-buffer overlay.
 fn open_overlay_fingerprint(overlay: &OpenFileOverlay) -> SourceFingerprint {
     SourceFingerprint::OpenBuffer {
         uri: overlay.uri.clone(),
@@ -490,14 +503,17 @@ fn open_overlay_fingerprint(overlay: &OpenFileOverlay) -> SourceFingerprint {
     }
 }
 
+/// Return the current open-buffer fingerprint for an analyzed path.
 fn open_buffer_fingerprint(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<SourceFingerprint> {
     overlays.iter().find(|overlay| overlay.path.as_ref() == path).map(open_overlay_fingerprint)
 }
 
+/// Return the line index for an open buffer referenced by compact ranges.
 fn open_line_index(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<Arc<line_index::LineIndex>> {
     overlays.iter().find(|overlay| overlay.path.as_ref() == path).map(|overlay| Arc::clone(&overlay.line_index))
 }
 
+/// Hash source text for stale-target detection without retaining full text.
 fn content_hash(contents: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     contents.hash(&mut hasher);
@@ -561,11 +577,13 @@ impl PackageAnalysisCache {
         Ok(CachedImportStubs { import_stubs, fingerprints })
     }
 
+    /// Mark a package-root cache entry as most recently used.
     fn touch_entry(&mut self, package_root: &StdPath) {
         self.order.retain(|candidate| candidate.as_path() != package_root);
         self.order.push_back(package_root.to_path_buf());
     }
 
+    /// Evict old package stub entries while preserving the entry just loaded.
     fn evict_old_entries(&mut self, protected: &StdPath) {
         self.order.retain(|package_root| self.entries.contains_key(package_root));
         let mut attempts = self.order.len();
@@ -866,9 +884,12 @@ impl<'a> CompilerSemanticCollector<'a> {
 }
 
 impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
+    /// Compiler semantic collection does not need caller-supplied visitor state.
     type AdditionalInput = ();
+    /// Visitor methods record occurrences through side effects.
     type Output = ();
 
+    /// Visit a function call and classify the callee as a function reference.
     fn visit_call(&mut self, input: &CallExpression, _additional: &Self::AdditionalInput) -> Self::Output {
         // Regular calls highlight the callee path as a function and then visit
         // all compile-time and runtime arguments as expressions.
@@ -877,6 +898,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         input.arguments.iter().for_each(|expr| self.visit_expression(expr, &()));
     }
 
+    /// Visit a composite literal, recording field names as member references.
     fn visit_composite_init(
         &mut self,
         input: &CompositeExpression,
@@ -895,6 +917,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         }
     }
 
+    /// Visit a composite type path and any const-generic arguments.
     fn visit_composite_type(&mut self, input: &CompositeType) {
         // Composite types reuse the same path identity logic as value-level
         // references, plus any const-generic arguments they carry.
@@ -902,6 +925,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         input.const_arguments.iter().for_each(|expr| self.visit_expression(expr, &()));
     }
 
+    /// Visit dynamic operations whose target identity cannot be fully resolved.
     fn visit_dynamic_op(&mut self, input: &DynamicOpExpression, _additional: &Self::AdditionalInput) -> Self::Output {
         self.visit_type(&input.interface);
         self.visit_expression(&input.target_program, &());
@@ -928,6 +952,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         }
     }
 
+    /// Visit `receiver.member` expressions and preserve the receiver-derived owner.
     fn visit_member_access(&mut self, input: &MemberAccess, _additional: &Self::AdditionalInput) -> Self::Output {
         // Member access records the receiver first so nested expressions still
         // contribute their own occurrences before the property reference.
@@ -936,6 +961,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         self.add_member_occurrence(owner, &input.name, OccurrenceRole::Reference, false, None);
     }
 
+    /// Visit a path, preferring lexical bindings before falling back to globals.
     fn visit_path(&mut self, input: &Path, _additional: &Self::AdditionalInput) -> Self::Output {
         if input.is_global() {
             self.visit_global_path(input);
@@ -964,6 +990,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         });
     }
 
+    /// Visit a block inside a new lexical scope.
     fn visit_block(&mut self, input: &leo_ast::Block) {
         // Blocks introduce lexical scope for definitions created inside them.
         self.push_scope();
@@ -971,6 +998,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         self.pop_scope();
     }
 
+    /// Visit a constant declaration as either global or scoped readonly state.
     fn visit_const(&mut self, input: &ConstDeclaration) {
         // Constants behave like readonly variable declarations for semantic
         // token purposes, even when they appear at top level.
@@ -994,6 +1022,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         }
     }
 
+    /// Visit a `let` definition and bind every declared local name.
     fn visit_definition(&mut self, input: &DefinitionStatement) {
         if let Some(type_) = &input.type_ {
             self.visit_type(type_);
@@ -1009,6 +1038,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         }
     }
 
+    /// Visit a loop while limiting the loop variable to the body scope.
     fn visit_iteration(&mut self, input: &IterationStatement) {
         if let Some(type_) = &input.type_ {
             self.visit_type(type_);
@@ -1024,6 +1054,7 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
 }
 
 impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
+    /// Visit an analyzed program, including imported stubs.
     fn visit_program(&mut self, input: &Program) {
         // Visit both owned source and imported stub graphs so semantic
         // identities remain available across dependency boundaries.
@@ -1032,6 +1063,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         input.stubs.values().for_each(|stub| self.visit_stub(stub));
     }
 
+    /// Visit a library root while preserving the surrounding module context.
     fn visit_library(&mut self, input: &leo_ast::Library) {
         // Libraries reuse the same collector machinery as programs, but their
         // top-level items live directly under the library name.
@@ -1048,6 +1080,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.current_module = previous_module;
     }
 
+    /// Visit one program scope and reset module qualifiers for its items.
     fn visit_program_scope(&mut self, input: &ProgramScope) {
         // Reset the module path at each program scope so top-level locations do
         // not accidentally inherit a nested module qualifier.
@@ -1071,6 +1104,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.current_module = previous_module;
     }
 
+    /// Visit a module with its fully qualified module path active.
     fn visit_module(&mut self, input: &Module) {
         // Modules replace the current module path wholesale because the AST
         // stores the full module path for each module node.
@@ -1087,6 +1121,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.current_module = previous_module;
     }
 
+    /// Visit a struct or record and anchor member declarations to the composite.
     fn visit_composite(&mut self, input: &Composite) {
         // Member identities are anchored to the enclosing composite location, so
         // push that owner before walking members.
@@ -1123,6 +1158,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.owner_stack.pop();
     }
 
+    /// Visit a concrete mapping declaration.
     fn visit_mapping(&mut self, input: &Mapping) {
         // Mappings surface to the editor like property-like global declarations.
         if let Some(range) = span_to_file_range(input.identifier.span) {
@@ -1139,6 +1175,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.visit_type(&input.value_type);
     }
 
+    /// Visit a concrete storage declaration.
     fn visit_storage_variable(&mut self, input: &StorageVariable) {
         // Storage declarations are highlighted the same way as other
         // property-shaped global state.
@@ -1155,6 +1192,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.visit_type(&input.type_);
     }
 
+    /// Visit an interface mapping prototype under the active owner.
     fn visit_mapping_prototype(&mut self, input: &MappingPrototype) {
         // Interface mapping prototypes mirror concrete mapping declarations for
         // semantic-token purposes, but without executable bodies.
@@ -1172,6 +1210,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.visit_type(&input.value_type);
     }
 
+    /// Visit an interface storage prototype under the active owner.
     fn visit_storage_variable_prototype(&mut self, input: &StorageVariablePrototype) {
         // Interface storage prototypes still contribute property declarations
         // even though no backing storage exists in this source file.
@@ -1188,6 +1227,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.visit_type(&input.type_);
     }
 
+    /// Visit a concrete function and bind its parameter/body scopes.
     fn visit_function(&mut self, input: &Function) {
         // Function parameters introduce the outermost lexical scope for the
         // function body, before nested blocks add their own scopes.
@@ -1217,6 +1257,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.pop_scope();
     }
 
+    /// Visit an interface and use it as the owner for all prototypes.
     fn visit_interface(&mut self, input: &Interface) {
         // Interface members share the interface as their semantic owner even
         // though they are prototype declarations rather than full definitions.
@@ -1243,6 +1284,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.owner_stack.pop();
     }
 
+    /// Visit an interface function prototype without a body.
     fn visit_function_prototype(&mut self, input: &FunctionPrototype) {
         // Prototype parameters still participate in local binding/highlighting
         // even though there is no executable body to visit.
@@ -1272,6 +1314,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         self.pop_scope();
     }
 
+    /// Visit an interface record prototype and its owned members.
     fn visit_record_prototype(&mut self, input: &RecordPrototype) {
         // Record members inherit the record prototype as their semantic owner.
         if let Some(range) = span_to_file_range(input.identifier.span) {
@@ -1487,6 +1530,7 @@ mod tests {
     };
     use tempfile::tempdir;
 
+    /// Build a test `file:` URI from a native path.
     fn file_uri(path: &Path) -> Uri {
         #[cfg(target_os = "windows")]
         let path = {
@@ -1501,10 +1545,12 @@ mod tests {
         format!("file://{path}").parse().expect("file uri")
     }
 
+    /// Build the minimal manifest dependency JSON for a local package.
     fn local_dependency_json(path: &Path) -> String {
         json!([{ "name": "helper", "location": "local", "path": path }]).to_string()
     }
 
+    /// Write a package manifest and source directory for dependency-cache tests.
     fn write_manifest(package_root: &Path, program: &str, dependencies: &str) {
         fs::create_dir_all(package_root.join("src")).expect("create source dir");
         fs::write(
@@ -1524,6 +1570,7 @@ mod tests {
         .expect("write manifest");
     }
 
+    /// Build a committed document snapshot for compiler-bridge tests.
     fn snapshot_for(path: &Path, text: &str) -> DocumentSnapshot {
         let uri = file_uri(path);
         let mut projects = ProjectModel::default();
@@ -1532,6 +1579,7 @@ mod tests {
         documents.commit_open(documents.prepare_open(uri, "leo".to_owned(), 1, text.to_owned(), file_path, project))
     }
 
+    /// Verifies network dependencies are ignored by local stub loading.
     #[test]
     fn import_stub_loader_skips_network_dependencies() {
         let tempdir = tempdir().expect("tempdir");
@@ -1556,6 +1604,7 @@ mod tests {
         assert_eq!(loaded.stubs.len(), 1);
     }
 
+    /// Verifies unchanged watched inputs reuse cached import stubs.
     #[test]
     fn package_cache_reuses_import_stubs_when_watched_inputs_are_unchanged() {
         let tempdir = tempdir().expect("tempdir");
@@ -1576,6 +1625,7 @@ mod tests {
         assert!(Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
     }
 
+    /// Verifies the worker-local package cache evicts old stub entries.
     #[test]
     fn package_cache_caps_open_stub_entries() {
         let mut cache = PackageAnalysisCache::default();
@@ -1597,6 +1647,7 @@ mod tests {
         assert!(cache.entries.contains_key(Path::new("/tmp").join("pkg-10").as_path()));
     }
 
+    /// Verifies dependency source rewrites invalidate cached stubs.
     #[test]
     fn package_cache_invalidates_when_dependency_sources_change() {
         let tempdir = tempdir().expect("tempdir");
@@ -1627,6 +1678,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
     }
 
+    /// Verifies new nested dependency modules invalidate cached stubs.
     #[test]
     fn package_cache_invalidates_when_nested_dependency_module_is_added() {
         let tempdir = tempdir().expect("tempdir");
@@ -1658,6 +1710,7 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
     }
 
+    /// Verifies same-size rewrites still change watched-path revisions.
     #[test]
     fn watched_paths_revision_changes_on_same_size_rewrite() {
         let tempdir = tempdir().expect("tempdir");
@@ -1671,6 +1724,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Verifies directory listing changes are part of watched-path revisions.
     #[test]
     fn watched_paths_revision_changes_when_directory_listing_changes() {
         let tempdir = tempdir().expect("tempdir");
@@ -1686,6 +1740,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    /// Verifies top-level const references share the declaration identity.
     #[test]
     fn top_level_consts_share_global_identity_with_references() {
         let tempdir = tempdir().expect("tempdir");
@@ -1716,6 +1771,7 @@ mod tests {
         assert!(occurrences.iter().all(|occurrence| occurrence.key == occurrences[0].key));
     }
 
+    /// Verifies member references resolve through the composite owner.
     #[test]
     fn member_references_reuse_resolved_composite_owner() {
         let tempdir = tempdir().expect("tempdir");
@@ -1755,6 +1811,7 @@ mod tests {
         assert_eq!(x_occurrences.iter().filter(|occurrence| occurrence.role == OccurrenceRole::Reference).count(), 2);
     }
 
+    /// Verifies same-named interface prototypes stay owner-qualified.
     #[test]
     fn interface_prototypes_with_same_name_use_owner_qualified_identities() {
         let tempdir = tempdir().expect("tempdir");

@@ -99,6 +99,7 @@ pub struct Compiler {
 }
 
 impl Compiler {
+    /// Return the network selected for this compiler instance.
     pub fn network(&self) -> NetworkName {
         self.state.network
     }
@@ -325,6 +326,7 @@ impl Compiler {
         }
     }
 
+    /// Run a compiler pass without an external cancellation check.
     pub fn do_pass<P: Pass>(&mut self, input: P::Input) -> Result<P::Output> {
         self.do_pass_with_check::<P, _>(input, &mut || Ok(()))
     }
@@ -1075,6 +1077,7 @@ fn load_source_dependency_stub(
     }
 }
 
+/// Build the public interface stub for a source dependency program.
 fn extract_program_interface_stub(_program_name: Symbol, program: &Program) -> Stub {
     let scope = program.program_scopes.values().next().expect("program AST should contain one program scope");
 
@@ -1160,6 +1163,7 @@ mod tests {
 
     use indexmap::IndexMap;
 
+    /// Verifies library parsing can read every source file from an in-memory source.
     #[test]
     fn parse_library_from_directory_in_memory() {
         create_session_if_not_set_then(|_| {
@@ -1204,6 +1208,7 @@ mod tests {
         });
     }
 
+    /// Verifies in-memory library builds still reject type errors.
     #[test]
     fn build_library_from_directory_in_memory_rejects_type_error() {
         create_session_if_not_set_then(|_| {
@@ -1241,6 +1246,7 @@ mod tests {
         });
     }
 
+    /// Verifies in-memory program parsing can load sibling modules.
     #[test]
     fn parse_program_from_directory_in_memory_with_module() {
         create_session_if_not_set_then(|_| {
