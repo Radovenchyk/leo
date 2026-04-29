@@ -46,20 +46,30 @@ use std::{
 /// targets.
 #[derive(Debug, Clone)]
 pub struct DefinitionQuery {
+    /// Requesting document URI, retained so pending requests can be cleared on close.
     pub uri: Uri,
+    /// Native path for the document where the cursor started.
     pub file_path: Arc<PathBuf>,
+    /// Original LSP position used as a fallback origin range for links.
     pub position: Position,
+    /// UTF-8 byte offset resolved from `position` before any async wait.
     pub offset: u32,
+    /// Line index for the exact open-buffer text that produced `offset`.
     pub line_index: Arc<LineIndex>,
+    /// Freshness key for the document view active when the request arrived.
     pub view_key: DocumentViewKey,
+    /// Whether the client accepts `LocationLink` responses with origin ranges.
     pub link_support: bool,
 }
 
 /// Feature-level result before JSON serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DefinitionResult {
+    /// No safe navigation target was found.
     None,
+    /// Plain LSP locations for clients without `LocationLink` support.
     Locations(Vec<Location>),
+    /// Rich links including the source selection range.
     Links(Vec<LocationLink>),
 }
 
@@ -145,6 +155,9 @@ fn compact_range_to_location_parts(range: CompactRange, package: &CachedPackageA
             byte_range_to_lsp_range(file.open_line_index.as_ref()?, range.start, range.end)?
         }
         SourceFingerprint::Disk { .. } => {
+            // Disk-backed targets are only emitted if the file still matches the
+            // exact bytes analyzed by the worker. This avoids returning ranges
+            // into a dependency file that changed after indexing.
             let text = read_verified_disk_text(file.path.as_ref(), &file.fingerprint)?;
             let line_index = LineIndex::new(text.as_str());
             byte_range_to_lsp_range(&line_index, range.start, range.end)?
@@ -169,6 +182,8 @@ fn read_verified_disk_text(path: &Path, expected: &SourceFingerprint) -> Option<
     let text = std::fs::read_to_string(path).ok()?;
     let metadata = std::fs::metadata(path).ok()?;
     let current_modified = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?.as_nanos();
+    // Size and mtime are cheap rejection tests; the content hash is the final
+    // guard for same-size rewrites or coarse filesystem timestamp behavior.
     if *len != metadata.len() || *modified_nanos != Some(current_modified) || *content_hash != hash_text(text.as_str())
     {
         return None;

@@ -101,26 +101,37 @@ struct ServerState {
 /// Shared semantic analysis and encoded document views.
 #[derive(Debug, Default)]
 struct AnalysisCaches {
+    /// Package analyses keyed by exact package/bucket generation.
     packages: HashMap<PackageAnalysisKey, Arc<CachedPackageAnalysis>>,
+    /// FIFO package cache order, capped so stale packages cannot accumulate.
     package_order: VecDeque<PackageAnalysisKey>,
+    /// Latest encoded view per URI. The embedded key proves freshness.
     document_views: HashMap<Uri, CachedDocumentView>,
+    /// Package keys whose latest analysis panicked; repeated requests fail fast.
     failed_packages: HashSet<PackageAnalysisKey>,
+    /// Document-view keys whose latest token-view build panicked.
     failed_views: HashSet<DocumentViewKey>,
+    /// Package analyses scheduled or running on the worker.
     in_flight_packages: HashSet<PackageAnalysisKey>,
+    /// Document views scheduled or running on the worker.
     in_flight_views: HashSet<DocumentViewKey>,
 }
 
 /// Pending semantic-token requests keyed by exact document-view freshness.
 #[derive(Debug, Default)]
 struct SemanticTokenRequestState {
+    /// Waiters grouped by the document-view key that will answer them.
     pending_by_key: HashMap<DocumentViewKey, Vec<RequestId>>,
+    /// Reverse lookup used to handle LSP `$/cancelRequest` in O(1) by ID.
     pending_owner: HashMap<RequestId, DocumentViewKey>,
 }
 
 /// Pending go-to-definition requests keyed by package analysis.
 #[derive(Debug, Default)]
 struct DefinitionRequestState {
+    /// Waiters grouped by package analysis, each preserving its own cursor query.
     pending_by_package: HashMap<PackageAnalysisKey, Vec<PendingDefinitionRequest>>,
+    /// Reverse lookup used to remove a cancelled request from its package queue.
     pending_owner: HashMap<RequestId, PackageAnalysisKey>,
 }
 
@@ -605,6 +616,8 @@ impl ServerState {
         }
 
         if self.definition_requests.queue(query, request_id.clone()) {
+            // Definition resolution needs the package index but not the encoded
+            // token view, so pending requests wait at package granularity.
             self.ensure_package_analysis(&view_key.package, &uri);
             Ok(())
         } else {
@@ -650,6 +663,8 @@ impl ServerState {
     fn store_document_view(&mut self, connection: &Connection, view: CachedDocumentView) {
         let key = view.key.clone();
         let uri = key.uri.clone();
+        // Cache by URI for cheap steady-state lookup; `document_view` checks the
+        // embedded key so a stale view never answers a newer generation.
         self.analysis.document_views.insert(uri.clone(), view.clone());
         let pending = self.semantic_token_requests.take_key(&key);
         if let Err(error) = send_ok_responses(connection, pending, response_value(view.encoded_tokens.as_ref())) {
@@ -662,6 +677,9 @@ impl ServerState {
             return;
         };
         for pending in self.definition_requests.take_package(key) {
+            // Each definition request keeps its original cursor offset and line
+            // index, so many requests can share one package analysis without
+            // collapsing to the same target.
             let value = definition_response_value(resolve_definition(&pending.query, package.as_ref()));
             if let Err(error) = send_ok_response(connection, pending.id, value) {
                 tracing::error!(error = %error, "failed to send definition response");
@@ -686,6 +704,9 @@ impl ServerState {
         current_bucket: &AnalysisBucket,
         message: &'static str,
     ) {
+        // Package analysis spans all open buffers in the bucket. Any committed
+        // edit or bucket move invalidates package-level state, document views,
+        // in-flight markers, and pending waiters that depended on old inputs.
         if let Some(previous_bucket) = previous_bucket
             && previous_bucket != current_bucket
         {
@@ -794,6 +815,9 @@ impl AnalysisCaches {
             self.package_order.push_back(package.key.clone());
         }
         self.packages.insert(package.key.clone(), package);
+        // Bound package analyses separately from worker stub caches. This keeps
+        // the routing thread from retaining package-sized indexes for closed or
+        // long-idle generations.
         while self.package_order.len() > MAX_PACKAGE_CACHE_ENTRIES {
             if let Some(oldest) = self.package_order.pop_front() {
                 self.packages.remove(&oldest);
@@ -859,6 +883,9 @@ impl SemanticTokenRequestState {
 
 impl DefinitionRequestState {
     fn queue(&mut self, query: DefinitionQuery, request_id: RequestId) -> bool {
+        // Definition requests are cheap individually but can otherwise pile up
+        // behind one slow package analysis. Cap both global and per-package
+        // waiters so a client burst cannot turn into unbounded retained queries.
         if self.pending_owner.len() >= MAX_PENDING_DEFINITIONS {
             return false;
         }
@@ -1015,6 +1042,10 @@ fn send_ok_responses(connection: &Connection, request_ids: Vec<RequestId>, resul
 
 fn send_definition_nulls(connection: &Connection, requests: Vec<PendingDefinitionRequest>) -> Result<()> {
     for request in requests {
+        // A close means the source document no longer exists from the client's
+        // point of view, so a successful "no definition" result is less noisy
+        // than `RequestCanceled`. Superseded open documents still use explicit
+        // cancellation so clients can distinguish stale work from no target.
         send_ok_response(connection, request.id, Value::Null)?;
     }
     Ok(())

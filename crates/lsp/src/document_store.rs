@@ -92,6 +92,7 @@ pub struct OpenDocument {
     pub generation: u64,
     pub file_path: Option<Arc<PathBuf>>,
     pub project: Option<Arc<ProjectContext>>,
+    /// Package-sized invalidation bucket this open document contributes to.
     pub analysis_bucket: AnalysisBucket,
     pub cancel_token: Arc<AtomicU64>,
 }
@@ -415,6 +416,10 @@ impl DocumentStore {
                     && let Some(project) = document.project.as_ref()
                     && !path.starts_with(project.source_directory.as_ref())
                 {
+                    // Managed package analysis compiles from the package source
+                    // root. Open files outside `src` share the package bucket
+                    // for invalidation, but they must not be offered to the
+                    // compiler as module overlays.
                     return None;
                 }
 

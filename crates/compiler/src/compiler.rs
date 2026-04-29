@@ -1024,6 +1024,9 @@ fn collect_source_directories(dir: &Path, watch_paths: &mut Vec<PathBuf>) -> Res
         let entry = entry.map_err(|error| CompilerError::file_read_error(dir.display().to_string(), error))?;
         let path = entry.path();
         if path.is_dir() {
+            // Watching only existing `.leo` files misses the first file added to
+            // an already-existing nested module directory. Include directories
+            // so LSP-side cache revisions notice those create/remove events.
             watch_paths.push(path.clone());
             collect_source_directories(&path, watch_paths)?;
         }

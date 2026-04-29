@@ -128,12 +128,21 @@ struct PackageAnalysisCacheEntry {
     /// Package-wide import stubs reused across snapshots from the same root.
     import_stubs: Arc<IndexMap<Symbol, leo_ast::Stub>>,
     /// Compact source fingerprints recorded while parsing dependency stubs.
+    ///
+    /// The cache stores these as a sorted slice instead of a `HashMap` because
+    /// they live as long as the package entry. We only need map lookup while
+    /// lowering one worker result, so `fingerprints_with` builds that transient
+    /// map at the boundary where it is actually useful.
     fingerprints: Arc<[(PathBuf, SourceFingerprint)]>,
     /// Filesystem inputs whose metadata changes invalidate `import_stubs`.
     watch_paths: Arc<[PathBuf]>,
     /// Per-path revision memo reused to avoid rehashing unchanged watched inputs.
     watch_state: HashMap<PathBuf, CachedWatchedPathRevision>,
-    /// Hash of the last observed metadata for `watch_paths`.
+    /// Aggregate watched-path revision for the cached stub set.
+    ///
+    /// Each path revision hashes the actual file bytes or recursive directory
+    /// listing, while `watch_state` lets unchanged metadata stamps reuse those
+    /// full revisions between checks.
     revision: u64,
 }
 
@@ -374,9 +383,16 @@ fn compiler_inputs(snapshot: &DocumentSnapshot) -> Option<(&Arc<PathBuf>, &Arc<P
 }
 
 /// File source that serves all open same-package buffers and records read fingerprints.
+///
+/// The compiler's [`FileSource`] trait takes `&self`, but go-to-definition must
+/// know the exact bytes the compiler consumed for every indexed file. This
+/// recorder therefore uses interior mutability to append fingerprints during
+/// `read_file`. It is created per worker job and never shared across threads, so
+/// `RefCell<HashMap<...>>` is the smallest honest tool here: a `Mutex` would add
+/// unnecessary atomic locking/poisoning machinery, and `DashMap` would imply
+/// concurrent writers that cannot exist for this job-local file source.
 struct RecordingFileSource {
     overlays: Arc<[OpenFileOverlay]>,
-    // Worker-local interior mutability keeps reads allocation-light without a mutex.
     fingerprints: RefCell<HashMap<PathBuf, SourceFingerprint>>,
 }
 
@@ -392,6 +408,9 @@ impl RecordingFileSource {
             .iter()
             .map(|(path, fingerprint)| (path.clone(), fingerprint.clone()))
             .collect::<Vec<_>>();
+        // Keep cached dependency fingerprints deterministic and compact. The
+        // semantic-index builder can expand this slice into a temporary map
+        // later, but the long-lived package cache does not pay for hash buckets.
         fingerprints.sort_by(|(left, _), (right, _)| left.cmp(right));
         Arc::from(fingerprints)
     }
@@ -421,6 +440,9 @@ impl FileSource for RecordingFileSource {
         let contents = std::fs::read_to_string(path)?;
         let after = std::fs::metadata(path).ok().and_then(|metadata| disk_stamp(&metadata));
         let fingerprint = match (before, after) {
+            // Only disk bytes bracketed by identical metadata are safe to
+            // re-open later for LSP range conversion. If a write races the
+            // read, we mark the file volatile and suppress cross-file targets.
             (Some(before), Some(after)) if before == after => SourceFingerprint::Disk {
                 modified_nanos: Some(after.modified_nanos),
                 len: after.len,
@@ -435,6 +457,8 @@ impl FileSource for RecordingFileSource {
     fn list_leo_files(&self, dir: &StdPath, exclude: &StdPath) -> io::Result<Vec<PathBuf>> {
         let mut files = DiskFileSource.list_leo_files(dir, exclude)?;
         for overlay in self.overlays.iter() {
+            // Include unsaved same-package module buffers in compiler analysis
+            // even if the file has not been flushed to disk yet.
             if overlay.path.starts_with(dir)
                 && overlay.path.extension().is_some_and(|extension| extension == "leo")
                 && overlay.path.as_ref() != exclude
@@ -519,6 +543,10 @@ impl PackageAnalysisCache {
         let mut watch_state = HashMap::new();
         let revision = watched_paths_revision_cached(watch_paths.as_ref(), &mut watch_state);
         let import_stubs = Arc::new(loaded.stubs);
+        // Capturing dependency fingerprints here is what lets source-dependency
+        // go-to-definition return real disk locations on cache hits. Without
+        // carrying these fingerprints alongside the stubs, dependency targets
+        // would later look volatile and be filtered out as unsafe.
         let fingerprints = file_source.dependency_fingerprints();
         let package_root = project.package_root.as_ref().clone();
         self.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {

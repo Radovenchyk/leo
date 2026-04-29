@@ -34,8 +34,11 @@ use std::{
     thread::{self, JoinHandle},
 };
 
+/// One wakeup is enough: real work lives in `PendingQueues` and coalesces there.
 const WORKER_CHANNEL_BOUND: usize = 1;
+/// Hard cap for heavy package jobs waiting behind the worker.
 const MAX_PENDING_PACKAGE_JOBS: usize = 16;
+/// Hard cap for lightweight document-view rebuilds waiting behind the worker.
 const MAX_PENDING_VIEW_JOBS: usize = 64;
 
 type PendingPackageJobs = HashMap<AnalysisBucket, PendingPackageJob>;
@@ -44,27 +47,38 @@ type PendingViewJobs = HashMap<DocumentViewKey, PendingViewJob>;
 /// Events sent from the background worker back to the main thread.
 #[derive(Debug)]
 pub enum WorkerEvent {
+    /// Fresh package analysis and trigger-document view are ready.
     PackageAnalyzed(PackageAnalysis),
+    /// A semantic-token view was rebuilt from an already cached package.
     DocumentViewBuilt(CachedDocumentView),
+    /// A package job became stale before or after worker execution.
     PackageCancelled { key: PackageAnalysisKey, uri: Uri, generation: u64 },
+    /// A document-view job became stale before or after worker execution.
     DocumentViewCancelled { key: DocumentViewKey },
+    /// Package analysis panicked inside the worker panic boundary.
     PackagePanicked { key: PackageAnalysisKey, uri: Uri, generation: u64, report: PanicReport },
+    /// Document-view construction panicked inside the worker panic boundary.
     DocumentViewPanicked { key: DocumentViewKey, report: PanicReport },
 }
 
 /// Worker-produced semantic state for one document generation.
 #[derive(Debug, Clone)]
 pub struct PackageAnalysis {
+    /// URI whose edit/request triggered this package analysis.
     pub uri: Uri,
+    /// Per-document generation of the triggering URI.
     pub generation: u64,
+    /// Package freshness key that all waiters must match.
     pub key: PackageAnalysisKey,
+    /// Shared package index plus the trigger document's encoded view.
     pub result: PackageWorkerAnalysis,
 }
 
 /// A coalesced worker job paired with its arrival order.
 ///
-/// The worker keeps at most one pending snapshot per URI, and `sequence`
-/// preserves global recency so the most recently updated document runs first.
+/// Package jobs are keyed by [`AnalysisBucket`], so the worker keeps at most
+/// one pending heavy-analysis snapshot per package bucket. `sequence` preserves
+/// global recency so the freshest package edit runs first.
 #[derive(Debug)]
 struct PendingPackageJob {
     sequence: u64,
@@ -84,6 +98,11 @@ struct PendingViewJob {
 /// tiny wakeup over the channel. Keeping package-sized snapshots out of the
 /// channel lets edit storms coalesce in place without blocking LSP request
 /// handling behind compiler work.
+///
+/// The mutex around this queue is intentionally not part of compiler analysis:
+/// it is held only while inserting, dropping, or removing queued jobs. The
+/// expensive worker path starts after the guard is gone, so request handling is
+/// not serialized behind package analysis.
 #[derive(Debug, Default)]
 struct PendingQueues {
     packages: PendingPackageJobs,
@@ -167,6 +186,9 @@ impl Scheduler {
     }
 
     fn wake_worker(&self) {
+        // The bounded wake channel carries no payload beyond "check the queue".
+        // If it is already full, the worker has either been woken or will wake
+        // shortly; another token would not represent another distinct job.
         let _ = self.wake_tx.try_send(WorkerWake::Wake);
     }
 }
@@ -209,6 +231,9 @@ fn worker_loop(
 }
 
 fn with_pending_queues<R>(pending: &Arc<Mutex<PendingQueues>>, f: impl FnOnce(&mut PendingQueues) -> R) -> R {
+    // Keep the critical section explicit and tiny. Callers should mutate queue
+    // metadata here, then do compiler or document-view work after the guard is
+    // dropped by returning from this helper.
     let mut pending = pending.lock().expect("scheduler pending queue mutex poisoned");
     f(&mut pending)
 }
@@ -255,6 +280,8 @@ fn take_next_job(pending: &Arc<Mutex<PendingQueues>>, package_cache: &mut Packag
             package_cache.retain_open_buckets(&open_buckets);
         }
 
+        // Package jobs come first because they unblock definition waiters and
+        // any semantic-token document views that need fresh package analysis.
         if let Some(snapshot) = take_latest_package(&mut pending.packages) {
             Some(WorkerJob::Package(snapshot))
         } else {

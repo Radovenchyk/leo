@@ -213,10 +213,19 @@ pub struct CompactOccurrenceRef<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceFingerprint {
     /// The analyzed file came from an open editor buffer.
+    ///
+    /// Open buffers carry their own line index, so navigation can convert
+    /// compact byte ranges without touching disk.
     OpenBuffer { uri: Uri, generation: u64, content_hash: u64 },
     /// The analyzed file came from disk with stable metadata around the read.
+    ///
+    /// Disk targets must be re-read and hash-checked before returning an LSP
+    /// location, because the server intentionally does not retain file text.
     Disk { modified_nanos: Option<u128>, len: u64, content_hash: u64 },
     /// The file source could not prove that metadata matched the read bytes.
+    ///
+    /// Volatile files stay in the semantic index for highlighting and local
+    /// lookup, but cross-file definition responses are suppressed for them.
     Volatile,
 }
 
@@ -372,6 +381,10 @@ impl SemanticIndex {
                 if occurrence.role == OccurrenceRole::Declaration {
                     definition_pairs.push((key, range));
                 }
+                // Some compiler paths attach the declaration range directly to
+                // references before the declaration occurrence is visited. Keep
+                // both sources and deduplicate after sorting so go-to-definition
+                // is robust to AST traversal order.
                 if let Some(declaration) = occurrence.identity.direct_declaration()
                     && let Some(declaration_range) = compact_range(declaration, &path_ids)
                 {
@@ -599,6 +612,9 @@ fn definition_slices(
     });
     pairs.dedup();
 
+    // Store targets in one flat range arena and keep a sorted `(key, slice)`
+    // table. That keeps package caches compact while preserving binary-search
+    // lookup for definition requests.
     let mut definitions = Vec::new();
     let mut ranges = Vec::new();
     let mut start = 0_usize;
