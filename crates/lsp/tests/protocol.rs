@@ -270,6 +270,107 @@ fn definition_resolves_function_type_and_member_targets() {
 }
 
 #[test]
+fn definition_resolves_saved_local_source_dependency_target() {
+    let tempdir = tempdir().expect("tempdir");
+
+    let helper_root = tempdir.path().join("helper");
+    let helper_src = helper_root.join("src");
+    fs::create_dir_all(&helper_src).expect("create helper source dir");
+    fs::write(
+        helper_root.join("program.json"),
+        r#"{ "program": "helper.aleo", "version": "0.1.0", "description": "", "license": "MIT", "leo": "4.0.0" }"#,
+    )
+    .expect("write helper manifest");
+    let helper_source = concat!(
+        "program helper.aleo {\n",
+        "    fn double(x: u32) -> u32 {\n",
+        "        return x + x;\n",
+        "    }\n",
+        "}\n",
+    );
+    let helper_path = helper_src.join("main.leo");
+    fs::write(&helper_path, helper_source).expect("write helper source");
+    let helper_root = helper_root.canonicalize().expect("canonical helper root");
+    let helper_uri = file_uri(&helper_path.canonicalize().expect("canonical helper source"));
+
+    let package_root = tempdir.path().join("example");
+    let source_dir = package_root.join("src");
+    fs::create_dir_all(&source_dir).expect("create source dir");
+    fs::write(
+        package_root.join("program.json"),
+        json!({
+            "program": "demo.aleo",
+            "version": "0.1.0",
+            "description": "",
+            "license": "MIT",
+            "leo": "4.0.0",
+            "dependencies": [
+                {
+                    "name": "helper.aleo",
+                    "location": "local",
+                    "path": helper_root,
+                }
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write manifest");
+
+    let source = concat!(
+        "import helper.aleo;\n\n",
+        "program demo.aleo {\n",
+        "    fn main(x: u32) -> u32 {\n",
+        "        return helper.aleo::double(x);\n",
+        "    }\n",
+        "}\n",
+    );
+    let main_path = source_dir.join("main.leo");
+    fs::write(&main_path, source).expect("write source");
+    let document_uri = file_uri(&main_path);
+
+    let mut server = TestServer::spawn(&[("RUST_LOG", "debug")]);
+    initialize(&mut server);
+    server.notify("initialized", json!({}));
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": document_uri,
+                "languageId": "leo",
+                "version": 1,
+                "text": source,
+            }
+        }),
+    );
+
+    let response = server.request(
+        2,
+        "textDocument/definition",
+        json!({
+            "textDocument": {
+                "uri": document_uri,
+            },
+            "position": position_json(source, "double", 0),
+        }),
+    );
+
+    assert_eq!(
+        response["result"][0]["uri"],
+        json!(helper_uri.to_string()),
+        "bad uri for dependency target: {response}; stderr:\n{}",
+        server.stderr_contents()
+    );
+    assert_eq!(response["result"][0]["range"], range_json(helper_source, "double", 0));
+
+    let shutdown = server.request(3, "shutdown", Value::Null);
+    assert_eq!(shutdown["result"], Value::Null);
+
+    server.notify("exit", json!({}));
+    let (status, stderr) = server.finish();
+    assert!(status.success(), "stderr:\n{stderr}");
+}
+
+#[test]
 fn exit_without_shutdown_returns_nonzero() {
     let mut server = TestServer::spawn(&[]);
     initialize(&mut server);

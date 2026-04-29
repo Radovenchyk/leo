@@ -882,6 +882,20 @@ impl Compiler {
 /// change the stub set. Editor caches can hash or stat those paths to know when
 /// dependency-backed semantic state must be rebuilt.
 pub fn load_import_stubs_for_package(package_root: &Path, network: NetworkName) -> Result<LoadedImportStubs> {
+    load_import_stubs_for_package_with_file_source(package_root, network, &DiskFileSource)
+}
+
+/// Load local dependency stubs using an explicit file source for Leo source reads.
+///
+/// This variant lets editor integrations serve unsaved overlays and record the
+/// exact disk bytes used for dependency source stubs. Manifest discovery still
+/// reads the real filesystem because dependencies are package-level metadata,
+/// but every parsed Leo source file flows through `file_source`.
+pub fn load_import_stubs_for_package_with_file_source(
+    package_root: &Path,
+    network: NetworkName,
+    file_source: &impl FileSource,
+) -> Result<LoadedImportStubs> {
     create_session_if_not_set_then(|_| {
         let package_root =
             package_root.canonicalize().map_err(|error| PackageError::failed_path(package_root.display(), error))?;
@@ -899,15 +913,19 @@ pub fn load_import_stubs_for_package(package_root: &Path, network: NetworkName) 
                 CompilationUnit::from_aleo_path(*name, path, &declared_dependencies)?
             } else {
                 let unit = CompilationUnit::from_package_path(*name, path)?;
-                watch_paths.extend(unit_watch_paths(&unit)?);
+                watch_paths.extend(unit_watch_paths(&unit, file_source)?);
                 unit
             };
 
             let stub = match &unit.data {
                 ProgramData::Bytecode(bytecode) => disassemble_dependency_bytecode(unit.name, bytecode, network)?,
-                ProgramData::SourcePath { directory, source } => {
-                    load_source_dependency_stub(&unit, source, dependency_source_directory(directory, source), network)?
-                }
+                ProgramData::SourcePath { directory, source } => load_source_dependency_stub(
+                    &unit,
+                    source,
+                    dependency_source_directory(directory, source),
+                    network,
+                    file_source,
+                )?,
             };
             import_stubs.insert(unit.name, stub);
         }
@@ -982,7 +1000,7 @@ fn normalize_local_dependency(base_path: &Path, mut dependency: Dependency) -> R
 }
 
 /// Return the manifest and source files whose metadata should invalidate one stubbed unit.
-fn unit_watch_paths(unit: &CompilationUnit) -> Result<Vec<PathBuf>> {
+fn unit_watch_paths(unit: &CompilationUnit, file_source: &impl FileSource) -> Result<Vec<PathBuf>> {
     let ProgramData::SourcePath { directory, source } = &unit.data else {
         return Ok(Vec::new());
     };
@@ -990,13 +1008,27 @@ fn unit_watch_paths(unit: &CompilationUnit) -> Result<Vec<PathBuf>> {
     let source_directory = dependency_source_directory(directory, source);
     let mut watch_paths = vec![directory.join(MANIFEST_FILENAME), source_directory.clone(), source.clone()];
     if source_directory.is_dir() {
-        let mut modules = DiskFileSource
+        collect_source_directories(&source_directory, &mut watch_paths)?;
+        let mut modules = file_source
             .list_leo_files(&source_directory, source)
             .map_err(|error| CompilerError::file_read_error(source_directory.display().to_string(), error))?;
         watch_paths.append(&mut modules);
     }
 
     Ok(watch_paths)
+}
+
+/// Collect source directories whose mtimes signal nested module creation/removal.
+fn collect_source_directories(dir: &Path, watch_paths: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(dir).map_err(|error| CompilerError::file_read_error(dir.display().to_string(), error))? {
+        let entry = entry.map_err(|error| CompilerError::file_read_error(dir.display().to_string(), error))?;
+        let path = entry.path();
+        if path.is_dir() {
+            watch_paths.push(path.clone());
+            collect_source_directories(&path, watch_paths)?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse a local dependency just far enough to recover the public interface
@@ -1006,6 +1038,7 @@ fn load_source_dependency_stub(
     source: &Path,
     source_directory: PathBuf,
     network: NetworkName,
+    file_source: &impl FileSource,
 ) -> Result<Stub> {
     let handler = Handler::default();
     let node_builder = Rc::new(NodeBuilder::default());
@@ -1027,13 +1060,13 @@ fn load_source_dependency_stub(
                 library_name,
                 source,
                 &source_directory,
-                &DiskFileSource,
+                file_source,
             )?;
             Ok(library.into())
         }
         PackageKind::Program | PackageKind::Test => {
             let program =
-                compiler.parse_program_from_directory_with_file_source(source, &source_directory, &DiskFileSource)?;
+                compiler.parse_program_from_directory_with_file_source(source, &source_directory, file_source)?;
             Ok(extract_program_interface_stub(unit.name, &program))
         }
     }

@@ -81,7 +81,7 @@ use leo_ast::{
     Type,
     UnitVisitor,
 };
-use leo_compiler::{Compiler, FrontendAnalysis, load_import_stubs_for_package};
+use leo_compiler::{Compiler, FrontendAnalysis, load_import_stubs_for_package_with_file_source};
 use leo_errors::Handler;
 use leo_passes::{SymbolTable, TypeTable, VariableType};
 use leo_span::{
@@ -92,13 +92,14 @@ use leo_span::{
     with_session_globals,
 };
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     fs::Metadata,
     hash::{DefaultHasher, Hash, Hasher},
     io,
     path::{Path as StdPath, PathBuf},
     rc::Rc,
-    sync::{Arc, Mutex, atomic::Ordering},
+    sync::{Arc, atomic::Ordering},
     time::UNIX_EPOCH,
 };
 
@@ -126,12 +127,23 @@ pub struct PackageAnalysisCache {
 struct PackageAnalysisCacheEntry {
     /// Package-wide import stubs reused across snapshots from the same root.
     import_stubs: Arc<IndexMap<Symbol, leo_ast::Stub>>,
+    /// Compact source fingerprints recorded while parsing dependency stubs.
+    fingerprints: Arc<[(PathBuf, SourceFingerprint)]>,
     /// Filesystem inputs whose metadata changes invalidate `import_stubs`.
     watch_paths: Arc<[PathBuf]>,
     /// Per-path revision memo reused to avoid rehashing unchanged watched inputs.
     watch_state: HashMap<PathBuf, CachedWatchedPathRevision>,
     /// Hash of the last observed metadata for `watch_paths`.
     revision: u64,
+}
+
+/// Cached import stubs plus the dependency source fingerprints captured when
+/// those stubs were parsed.
+#[derive(Debug, Clone)]
+struct CachedImportStubs {
+    import_stubs: Arc<IndexMap<Symbol, leo_ast::Stub>>,
+    /// Sorted slice instead of a cached hash table to keep package caches lean.
+    fingerprints: Arc<[(PathBuf, SourceFingerprint)]>,
 }
 
 /// Memoized revision for one watched path.
@@ -302,7 +314,8 @@ fn compiler_occurrences(
     let result = create_session_if_not_set_then(|_| {
         // Dependency resolution and parsing intern symbols, so the worker must
         // enter a Leo session before it asks the compiler for frontend state.
-        let import_stubs = package_cache.import_stubs_for(project.as_ref()).map_err(|error| {
+        let file_source = RecordingFileSource::new(Arc::clone(&snapshot.open_overlays));
+        let import_stubs = package_cache.import_stubs_for(project.as_ref(), &file_source).map_err(|error| {
             tracing::debug!(
                 package = project.package_root.display().to_string(),
                 error,
@@ -313,7 +326,6 @@ fn compiler_occurrences(
 
         // Run the compiler against every open same-package editor buffer while
         // recording fingerprints for disk files at the exact read boundary.
-        let file_source = RecordingFileSource::new(Arc::clone(&snapshot.open_overlays));
         let mut compiler = Compiler::new(
             Some(project.program_name.to_string()),
             false,
@@ -321,7 +333,7 @@ fn compiler_occurrences(
             Rc::new(leo_ast::NodeBuilder::default()),
             PathBuf::default(),
             Some(leo_compiler::CompilerOptions::default()),
-            import_stubs.as_ref().clone(),
+            import_stubs.import_stubs.as_ref().clone(),
             leo_ast::NetworkName::TestnetV0,
         );
 
@@ -338,7 +350,7 @@ fn compiler_occurrences(
         check_snapshot_current(snapshot).map_err(|error| error.to_string())?;
         Ok::<_, String>(CompilerOutput {
             occurrences: CompilerSemanticCollector::new(symbol_table, type_table).collect(ast),
-            fingerprints: file_source.fingerprints(),
+            fingerprints: file_source.fingerprints_with(import_stubs.fingerprints.as_ref()),
         })
     });
 
@@ -364,20 +376,36 @@ fn compiler_inputs(snapshot: &DocumentSnapshot) -> Option<(&Arc<PathBuf>, &Arc<P
 /// File source that serves all open same-package buffers and records read fingerprints.
 struct RecordingFileSource {
     overlays: Arc<[OpenFileOverlay]>,
-    fingerprints: Mutex<HashMap<PathBuf, SourceFingerprint>>,
+    // Worker-local interior mutability keeps reads allocation-light without a mutex.
+    fingerprints: RefCell<HashMap<PathBuf, SourceFingerprint>>,
 }
 
 impl RecordingFileSource {
     fn new(overlays: Arc<[OpenFileOverlay]>) -> Self {
-        Self { overlays, fingerprints: Mutex::new(HashMap::new()) }
+        Self { overlays, fingerprints: RefCell::new(HashMap::new()) }
     }
 
-    fn fingerprints(&self) -> HashMap<PathBuf, SourceFingerprint> {
-        self.fingerprints.lock().expect("recording file-source mutex poisoned").clone()
+    fn dependency_fingerprints(&self) -> Arc<[(PathBuf, SourceFingerprint)]> {
+        let mut fingerprints = self
+            .fingerprints
+            .borrow()
+            .iter()
+            .map(|(path, fingerprint)| (path.clone(), fingerprint.clone()))
+            .collect::<Vec<_>>();
+        fingerprints.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Arc::from(fingerprints)
+    }
+
+    fn fingerprints_with(&self, cached: &[(PathBuf, SourceFingerprint)]) -> HashMap<PathBuf, SourceFingerprint> {
+        let recorded = self.fingerprints.borrow();
+        let mut fingerprints = HashMap::with_capacity(cached.len() + recorded.len());
+        fingerprints.extend(cached.iter().cloned());
+        fingerprints.extend(recorded.iter().map(|(path, fingerprint)| (path.clone(), fingerprint.clone())));
+        fingerprints
     }
 
     fn record(&self, path: &StdPath, fingerprint: SourceFingerprint) {
-        self.fingerprints.lock().expect("recording file-source mutex poisoned").insert(path.to_path_buf(), fingerprint);
+        self.fingerprints.borrow_mut().insert(path.to_path_buf(), fingerprint);
     }
 }
 
@@ -465,33 +493,44 @@ impl PackageAnalysisCache {
 
     /// Return cached import stubs for the project, reloading them whenever the
     /// watched manifest or source metadata changes.
-    fn import_stubs_for(&mut self, project: &ProjectContext) -> Result<Arc<IndexMap<Symbol, leo_ast::Stub>>, String> {
+    fn import_stubs_for(
+        &mut self,
+        project: &ProjectContext,
+        file_source: &RecordingFileSource,
+    ) -> Result<CachedImportStubs, String> {
         if let Some(entry) = self.entries.get_mut(project.package_root.as_ref())
             && entry.revision == watched_paths_revision_cached(entry.watch_paths.as_ref(), &mut entry.watch_state)
         {
             let import_stubs = Arc::clone(&entry.import_stubs);
+            let fingerprints = Arc::clone(&entry.fingerprints);
             self.touch_entry(project.package_root.as_ref());
-            return Ok(import_stubs);
+            return Ok(CachedImportStubs { import_stubs, fingerprints });
         }
 
         // Import stubs are package-wide, but they depend on manifest/source
         // metadata. Rebuild the entry when any watched input changes.
-        let loaded = load_import_stubs_for_package(project.package_root.as_ref(), leo_ast::NetworkName::TestnetV0)
-            .map_err(|error| error.to_string())?;
+        let loaded = load_import_stubs_for_package_with_file_source(
+            project.package_root.as_ref(),
+            leo_ast::NetworkName::TestnetV0,
+            file_source,
+        )
+        .map_err(|error| error.to_string())?;
         let watch_paths = Arc::<[PathBuf]>::from(loaded.watch_paths);
         let mut watch_state = HashMap::new();
         let revision = watched_paths_revision_cached(watch_paths.as_ref(), &mut watch_state);
         let import_stubs = Arc::new(loaded.stubs);
+        let fingerprints = file_source.dependency_fingerprints();
         let package_root = project.package_root.as_ref().clone();
         self.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
             import_stubs: Arc::clone(&import_stubs),
+            fingerprints: Arc::clone(&fingerprints),
             watch_paths,
             watch_state,
             revision,
         });
         self.touch_entry(&package_root);
         self.evict_old_entries(&package_root);
-        Ok(import_stubs)
+        Ok(CachedImportStubs { import_stubs, fingerprints })
     }
 
     fn touch_entry(&mut self, package_root: &StdPath) {
@@ -603,6 +642,17 @@ impl<'a> CompilerSemanticCollector<'a> {
         let mut path = self.current_module.clone();
         path.push(name);
         Location::new(self.current_program, path)
+    }
+
+    /// Build a nested declaration location under the current semantic owner.
+    fn owned_item_location(&self, name: Symbol) -> Location {
+        if let Some(owner) = self.current_owner() {
+            let mut path = owner.path;
+            path.push(name);
+            Location::new(owner.program, path)
+        } else {
+            self.current_item_location(name)
+        }
     }
 
     /// Record a program or imported-namespace occurrence.
@@ -1083,7 +1133,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         if let Some(range) = span_to_file_range(input.identifier.span) {
             self.add_global_occurrence(
                 range.clone(),
-                self.current_item_location(input.identifier.name),
+                self.owned_item_location(input.identifier.name),
                 Some(range),
                 OccurrenceRole::Declaration,
                 SemanticKind::Property,
@@ -1100,7 +1150,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         if let Some(range) = span_to_file_range(input.identifier.span) {
             self.add_global_occurrence(
                 range.clone(),
-                self.current_item_location(input.identifier.name),
+                self.owned_item_location(input.identifier.name),
                 Some(range),
                 OccurrenceRole::Declaration,
                 SemanticKind::Property,
@@ -1169,7 +1219,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
         // Prototype parameters still participate in local binding/highlighting
         // even though there is no executable body to visit.
         if let Some(range) = span_to_file_range(input.identifier.span) {
-            let location = self.current_item_location(input.identifier.name);
+            let location = self.owned_item_location(input.identifier.name);
             self.add_global_occurrence(
                 range.clone(),
                 location,
@@ -1197,7 +1247,7 @@ impl<'a> UnitVisitor for CompilerSemanticCollector<'a> {
     fn visit_record_prototype(&mut self, input: &RecordPrototype) {
         // Record members inherit the record prototype as their semantic owner.
         if let Some(range) = span_to_file_range(input.identifier.span) {
-            let location = self.current_item_location(input.identifier.name);
+            let location = self.owned_item_location(input.identifier.name);
             self.add_global_occurrence(
                 range.clone(),
                 location.clone(),
@@ -1394,13 +1444,19 @@ mod tests {
     use crate::{
         document_store::{DocumentSnapshot, DocumentStore},
         project_model::ProjectModel,
-        semantics::{OccurrenceRole, SemanticSource},
+        semantics::{OccurrenceRole, SemanticSource, SourceFingerprint},
     };
     use leo_ast::NetworkName;
     use leo_compiler::load_import_stubs_for_package;
     use lsp_types::Uri;
     use serde_json::json;
-    use std::{fs, path::Path, sync::Arc, thread, time::Duration};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+        thread,
+        time::Duration,
+    };
     use tempfile::tempdir;
 
     fn file_uri(path: &Path) -> Uri {
@@ -1485,10 +1541,11 @@ mod tests {
         let project = project.expect("project context");
 
         let mut cache = PackageAnalysisCache::default();
-        let first = cache.import_stubs_for(project.as_ref()).expect("initial cache load");
-        let second = cache.import_stubs_for(project.as_ref()).expect("cached load");
+        let file_source = super::RecordingFileSource::new(Arc::from([]));
+        let first = cache.import_stubs_for(project.as_ref(), &file_source).expect("initial cache load");
+        let second = cache.import_stubs_for(project.as_ref(), &file_source).expect("cached load");
 
-        assert!(Arc::ptr_eq(&first, &second));
+        assert!(Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
     }
 
     #[test]
@@ -1499,6 +1556,7 @@ mod tests {
             let package_root = Path::new("/tmp").join(format!("pkg-{index}"));
             cache.entries.insert(package_root.clone(), PackageAnalysisCacheEntry {
                 import_stubs: Arc::new(Default::default()),
+                fingerprints: Arc::from(Vec::<(PathBuf, SourceFingerprint)>::new()),
                 watch_paths: Arc::from([]),
                 watch_state: Default::default(),
                 revision: index as u64,
@@ -1530,14 +1588,46 @@ mod tests {
         let project = project.expect("project context");
 
         let mut cache = PackageAnalysisCache::default();
-        let first = cache.import_stubs_for(project.as_ref()).expect("initial cache load");
+        let file_source = super::RecordingFileSource::new(Arc::from([]));
+        let first = cache.import_stubs_for(project.as_ref(), &file_source).expect("initial cache load");
 
         thread::sleep(Duration::from_millis(20));
         fs::write(&helper_source, "const VALUE: u32 = 2u32;\nconst EXTRA: u32 = VALUE + 1u32;\n")
             .expect("update helper source");
 
-        let second = cache.import_stubs_for(project.as_ref()).expect("reloaded cache entry");
-        assert!(!Arc::ptr_eq(&first, &second));
+        let second = cache.import_stubs_for(project.as_ref(), &file_source).expect("reloaded cache entry");
+        assert!(!Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
+    }
+
+    #[test]
+    fn package_cache_invalidates_when_nested_dependency_module_is_added() {
+        let tempdir = tempdir().expect("tempdir");
+        let helper_root = tempdir.path().join("helper");
+        write_manifest(&helper_root, "helper", "null");
+        let nested_dir = helper_root.join("src").join("nested");
+        fs::create_dir_all(&nested_dir).expect("create nested module dir");
+        fs::write(helper_root.join("src").join("lib.leo"), "const VALUE: u32 = 1u32;\n").expect("write helper source");
+        let helper_root = helper_root.canonicalize().expect("canonical helper root");
+        let nested_module = nested_dir.join("extra.leo");
+
+        let root = tempdir.path().join("root");
+        write_manifest(&root, "root.aleo", &local_dependency_json(&helper_root));
+        let main_path = root.join("src").join("main.leo");
+        fs::write(&main_path, "program root.aleo {}\n").expect("write root source");
+
+        let mut projects = ProjectModel::default();
+        let (_, project) = projects.resolve_document_context(&file_uri(&main_path));
+        let project = project.expect("project context");
+
+        let mut cache = PackageAnalysisCache::default();
+        let file_source = super::RecordingFileSource::new(Arc::from([]));
+        let first = cache.import_stubs_for(project.as_ref(), &file_source).expect("initial cache load");
+
+        thread::sleep(Duration::from_millis(20));
+        fs::write(nested_module, "const EXTRA: u32 = 2u32;\n").expect("write nested helper module");
+
+        let second = cache.import_stubs_for(project.as_ref(), &file_source).expect("reloaded cache entry");
+        assert!(!Arc::ptr_eq(&first.import_stubs, &second.import_stubs));
     }
 
     #[test]
@@ -1635,5 +1725,44 @@ mod tests {
         assert!(x_occurrences.iter().all(|occurrence| occurrence.key == x_occurrences[0].key));
         assert!(x_occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Declaration));
         assert_eq!(x_occurrences.iter().filter(|occurrence| occurrence.role == OccurrenceRole::Reference).count(), 2);
+    }
+
+    #[test]
+    fn interface_prototypes_with_same_name_use_owner_qualified_identities() {
+        let tempdir = tempdir().expect("tempdir");
+        let root = tempdir.path().join("root");
+        write_manifest(&root, "root.aleo", "null");
+        let source = concat!(
+            "interface First {\n",
+            "    fn shared() -> u32;\n",
+            "}\n\n",
+            "interface Second {\n",
+            "    fn shared() -> u32;\n",
+            "}\n\n",
+            "program root.aleo {\n",
+            "    fn main() {}\n",
+            "}\n",
+        );
+        fs::write(root.join("src").join("main.leo"), source).expect("write root source");
+        let main_path = root.join("src").join("main.leo").canonicalize().expect("canonical main path");
+
+        let snapshot = snapshot_for(&main_path, source);
+        let semantic_snapshot = analyze_snapshot(&snapshot, &mut PackageAnalysisCache::default());
+
+        assert_eq!(semantic_snapshot.source, SemanticSource::CompilerEnhanced);
+
+        let shared_occurrences = semantic_snapshot
+            .index
+            .occurrences
+            .iter()
+            .filter(|occurrence| {
+                semantic_snapshot.index.files[occurrence.range.file as usize].as_ref() == &main_path
+                    && &source[occurrence.range.start as usize..occurrence.range.end as usize] == "shared"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shared_occurrences.len(), 2);
+        assert!(shared_occurrences.iter().all(|occurrence| occurrence.role == OccurrenceRole::Declaration));
+        assert!(shared_occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
+        assert_ne!(shared_occurrences[0].key, shared_occurrences[1].key);
     }
 }
