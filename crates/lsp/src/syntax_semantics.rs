@@ -21,7 +21,7 @@
 //! lexical tokens for full editor highlighting coverage.
 
 use crate::{
-    document_store::DocumentSnapshot,
+    document_store::{DocumentSnapshot, DocumentViewSnapshot},
     project_model::ProjectKind,
     semantics::{
         FileRange,
@@ -47,13 +47,26 @@ pub(crate) struct SyntaxSemantics {
 
 /// Collect syntax-only symbols and lexical tokens for the snapshot's current text.
 pub(crate) fn collect(snapshot: &DocumentSnapshot) -> SyntaxSemantics {
-    let parse = match choose_syntax_parser(snapshot) {
-        SyntaxParser::Main => parse_main(snapshot.text.as_ref()),
-        SyntaxParser::Module => parse_module(snapshot.text.as_ref()),
+    collect_parts(snapshot.text.as_ref(), snapshot.file_path.as_ref(), snapshot.project.as_ref())
+}
+
+/// Collect syntax-only symbols and lexical tokens for a document-view job.
+pub(crate) fn collect_view(snapshot: &DocumentViewSnapshot) -> SyntaxSemantics {
+    collect_parts(snapshot.text.as_ref(), snapshot.file_path.as_ref(), snapshot.project.as_ref())
+}
+
+fn collect_parts(
+    text: &str,
+    file_path: Option<&Arc<PathBuf>>,
+    project: Option<&Arc<crate::project_model::ProjectContext>>,
+) -> SyntaxSemantics {
+    let parse = match choose_syntax_parser(file_path, project) {
+        SyntaxParser::Main => parse_main(text),
+        SyntaxParser::Module => parse_module(text),
     };
 
     let mut semantics = parse
-        .map(|tree| SyntaxSemanticCollector::new(current_document_path(snapshot)).collect(&tree))
+        .map(|tree| SyntaxSemanticCollector::new(current_document_path(file_path)).collect(&tree))
         .unwrap_or_default();
     // Symbol occurrences are sorted here because compiler-backed occurrences
     // merge with this vector before final semantic-token encoding.
@@ -62,13 +75,16 @@ pub(crate) fn collect(snapshot: &DocumentSnapshot) -> SyntaxSemantics {
 }
 
 /// Choose the Rowan parser entry point that best matches this snapshot.
-fn choose_syntax_parser(snapshot: &DocumentSnapshot) -> SyntaxParser {
-    if let Some(project) = snapshot.project.as_ref() {
+fn choose_syntax_parser(
+    file_path: Option<&Arc<PathBuf>>,
+    project: Option<&Arc<crate::project_model::ProjectContext>>,
+) -> SyntaxParser {
+    if let Some(project) = project {
         // The Rowan parser uses a distinct entry-point grammar for `main.leo`.
         // Reuse the project model's entry-file resolution so syntax fallback
         // mirrors the same program-vs-module distinction as the compiler path.
         return match project.kind {
-            ProjectKind::Program if snapshot.file_path.as_ref() == Some(&project.entry_file) => SyntaxParser::Main,
+            ProjectKind::Program if file_path == Some(&project.entry_file) => SyntaxParser::Main,
             ProjectKind::Program | ProjectKind::Library => SyntaxParser::Module,
         };
     }
@@ -80,8 +96,8 @@ fn choose_syntax_parser(snapshot: &DocumentSnapshot) -> SyntaxParser {
 }
 
 /// Return the current document path, or an empty placeholder for unmanaged buffers.
-fn current_document_path(snapshot: &DocumentSnapshot) -> Arc<PathBuf> {
-    snapshot.file_path.clone().unwrap_or_else(|| Arc::new(PathBuf::new()))
+fn current_document_path(file_path: Option<&Arc<PathBuf>>) -> Arc<PathBuf> {
+    file_path.cloned().unwrap_or_else(|| Arc::new(PathBuf::new()))
 }
 
 /// Syntax parser mode used by the fallback highlighter.
@@ -403,17 +419,12 @@ mod tests {
     use super::collect;
     use crate::{
         compiler_bridge::PackageAnalysisCache,
-        document_store::DocumentSnapshot,
+        document_store::{DocumentSnapshot, DocumentStore},
         project_model::ProjectModel,
         semantics::{OccurrenceRole, SemanticKind, SemanticSource},
     };
-    use line_index::LineIndex;
     use lsp_types::Uri;
-    use std::{
-        fs,
-        path::Path,
-        sync::{Arc, atomic::AtomicU64},
-    };
+    use std::{fs, path::Path};
     use tempfile::tempdir;
 
     fn file_uri(path: &Path) -> Uri {
@@ -434,17 +445,8 @@ mod tests {
         let uri = file_uri(path);
         let mut projects = ProjectModel::default();
         let (file_path, project) = projects.resolve_document_context(&uri);
-
-        DocumentSnapshot {
-            uri,
-            text: Arc::from(text),
-            line_index: Arc::new(LineIndex::new(text)),
-            version: 1,
-            generation: 1,
-            file_path,
-            project,
-            cancel_token: Arc::new(AtomicU64::new(1)),
-        }
+        let mut documents = DocumentStore::default();
+        documents.commit_open(documents.prepare_open(uri, "leo".to_owned(), 1, text.to_owned(), file_path, project))
     }
 
     #[test]

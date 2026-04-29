@@ -14,13 +14,23 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
+#![allow(clippy::mutable_key_type)]
+
 use crate::{
-    document_store::DocumentStore,
-    features::semantic_tokens::{capability as semantic_tokens_capability, empty_response_value, response_value},
+    document_store::{DocumentStore, DocumentViewKey, PackageAnalysisKey},
+    features::{
+        goto_definition::{
+            DefinitionQuery,
+            position_to_offset,
+            resolve as resolve_definition,
+            response_value as definition_response_value,
+        },
+        semantic_tokens::{capability as semantic_tokens_capability, empty_response_value, response_value},
+    },
     panic_boundary::catch_unwind,
     project_model::{ProjectModel, uri_to_file_path},
-    scheduler::{DocumentAnalysis, Scheduler, WorkerEvent},
-    semantics::SemanticSnapshot,
+    scheduler::{PackageAnalysis, Scheduler, WorkerEvent},
+    semantics::{CachedDocumentView, CachedPackageAnalysis},
 };
 use anyhow::{Context, Result};
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, RequestId, Response, ResponseError};
@@ -29,9 +39,11 @@ use lsp_types::{
     DidChangeTextDocumentParams,
     DidCloseTextDocumentParams,
     DidOpenTextDocumentParams,
+    GotoDefinitionParams,
     InitializeParams,
     InitializeResult,
     NumberOrString,
+    OneOf,
     SemanticTokensParams,
     ServerCapabilities,
     ServerInfo,
@@ -42,7 +54,12 @@ use lsp_types::{
     Uri,
 };
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, process::ExitCode};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
+    process::ExitCode,
+    sync::Arc,
+};
 
 const INTERNAL_ERROR: i32 = -32603;
 const METHOD_NOT_FOUND: i32 = -32601;
@@ -55,6 +72,10 @@ const DID_CHANGE: &str = "textDocument/didChange";
 const DID_CLOSE: &str = "textDocument/didClose";
 const CANCEL_REQUEST: &str = "$/cancelRequest";
 const SEMANTIC_TOKENS_FULL: &str = "textDocument/semanticTokens/full";
+const TEXT_DOCUMENT_DEFINITION: &str = "textDocument/definition";
+const MAX_PACKAGE_CACHE_ENTRIES: usize = 8;
+const MAX_PENDING_DEFINITIONS: usize = 128;
+const MAX_PENDING_DEFINITIONS_PER_KEY: usize = 16;
 
 /// In-memory state for one running `leo-lsp` server instance.
 ///
@@ -70,52 +91,44 @@ struct ServerState {
     documents: DocumentStore,
     project_model: ProjectModel,
     scheduler: Scheduler,
-    /// Async request state for generation-scoped semantic-token results.
-    ///
-    /// Additional async document features can reuse the same bookkeeping
-    /// pattern instead of growing bespoke pending/cached/failure maps.
-    semantic_tokens: DocumentRequestState<SemanticSnapshot>,
+    analysis: AnalysisCaches,
+    semantic_token_requests: SemanticTokenRequestState,
+    definition_requests: DefinitionRequestState,
+    client_definition_link_support: bool,
     hooks: TestHooks,
 }
 
-/// Shared state for one async LSP capability that resolves per-document generations.
-#[derive(Debug)]
-struct DocumentRequestState<T> {
-    cached: HashMap<Uri, CachedDocumentResult<T>>,
-    failed: HashMap<Uri, FailedDocumentResult>,
-    pending_by_uri: HashMap<Uri, Vec<RequestId>>,
-    pending_owner: HashMap<RequestId, Uri>,
+/// Shared semantic analysis and encoded document views.
+#[derive(Debug, Default)]
+struct AnalysisCaches {
+    packages: HashMap<PackageAnalysisKey, Arc<CachedPackageAnalysis>>,
+    package_order: VecDeque<PackageAnalysisKey>,
+    document_views: HashMap<Uri, CachedDocumentView>,
+    failed_packages: HashSet<PackageAnalysisKey>,
+    failed_views: HashSet<DocumentViewKey>,
+    in_flight_packages: HashSet<PackageAnalysisKey>,
+    in_flight_views: HashSet<DocumentViewKey>,
 }
 
-/// Successful async result paired with the document generation it belongs to.
+/// Pending semantic-token requests keyed by exact document-view freshness.
+#[derive(Debug, Default)]
+struct SemanticTokenRequestState {
+    pending_by_key: HashMap<DocumentViewKey, Vec<RequestId>>,
+    pending_owner: HashMap<RequestId, DocumentViewKey>,
+}
+
+/// Pending go-to-definition requests keyed by package analysis.
+#[derive(Debug, Default)]
+struct DefinitionRequestState {
+    pending_by_package: HashMap<PackageAnalysisKey, Vec<PendingDefinitionRequest>>,
+    pending_owner: HashMap<RequestId, PackageAnalysisKey>,
+}
+
+/// One pending definition request with its own cursor query preserved.
 #[derive(Debug, Clone)]
-struct CachedDocumentResult<T> {
-    generation: u64,
-    value: T,
-}
-
-/// Failed async result paired with the document generation it belongs to.
-#[derive(Debug, Clone, Copy)]
-struct FailedDocumentResult {
-    generation: u64,
-}
-
-/// Immediate state of an async document request for the current generation.
-enum DocumentRequestStatus<'a, T> {
-    Cached(&'a T),
-    Failed,
-    Pending,
-}
-
-impl<T> Default for DocumentRequestState<T> {
-    fn default() -> Self {
-        Self {
-            cached: HashMap::new(),
-            failed: HashMap::new(),
-            pending_by_uri: HashMap::new(),
-            pending_owner: HashMap::new(),
-        }
-    }
+struct PendingDefinitionRequest {
+    id: RequestId,
+    query: DefinitionQuery,
 }
 
 pub(crate) fn run(connection: Connection) -> Result<ExitCode> {
@@ -127,6 +140,7 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
     let initialize_params: InitializeParams =
         serde_json::from_value(params).context("failed to deserialize initialize params")?;
     let workspace_roots = collect_workspace_roots(&initialize_params);
+    let client_definition_link_support = client_supports_definition_links(&initialize_params);
 
     // Finish the initialize handshake before any main-loop state exists so the
     // steady-state server only has to reason about post-initialize traffic.
@@ -147,7 +161,10 @@ fn run_with_hooks(connection: Connection, hooks: TestHooks) -> Result<ExitCode> 
         documents: DocumentStore::default(),
         project_model: ProjectModel::default(),
         scheduler: Scheduler::new(hooks.panic_on_worker_job),
-        semantic_tokens: DocumentRequestState::default(),
+        analysis: AnalysisCaches::default(),
+        semantic_token_requests: SemanticTokenRequestState::default(),
+        definition_requests: DefinitionRequestState::default(),
+        client_definition_link_support,
         hooks,
     };
 
@@ -228,6 +245,11 @@ impl ServerState {
                 let params: SemanticTokensParams =
                     serde_json::from_value(params).context("failed to deserialize semanticTokens/full")?;
                 self.handle_semantic_tokens_full(connection, request_id, params)
+            }
+            TEXT_DOCUMENT_DEFINITION => {
+                let params: GotoDefinitionParams =
+                    serde_json::from_value(params).context("failed to deserialize textDocument/definition")?;
+                self.handle_goto_definition(connection, request_id, params)
             }
             _ => {
                 tracing::debug!(method, "request is not implemented");
@@ -313,8 +335,10 @@ impl ServerState {
         self.hooks.maybe_panic_notification(DID_OPEN);
 
         let snapshot = self.documents.commit_open(prepared);
-        self.semantic_tokens.invalidate(&snapshot.uri);
-        self.scheduler.enqueue(snapshot);
+        self.analysis.invalidate_uri(&snapshot.uri);
+        self.scheduler.set_open_buckets(self.documents.open_buckets());
+        self.analysis.in_flight_packages.insert(snapshot.package_key.clone());
+        self.scheduler.enqueue_package(snapshot);
     }
 
     fn handle_did_change(&mut self, params: DidChangeTextDocumentParams) {
@@ -338,27 +362,43 @@ impl ServerState {
         self.hooks.maybe_panic_notification(DID_CHANGE);
 
         let snapshot = self.documents.commit_change(prepared);
-        self.semantic_tokens.invalidate(&snapshot.uri);
-        self.scheduler.enqueue(snapshot);
+        self.analysis.invalidate_uri(&snapshot.uri);
+        self.scheduler.set_open_buckets(self.documents.open_buckets());
+        self.analysis.in_flight_packages.insert(snapshot.package_key.clone());
+        self.scheduler.enqueue_package(snapshot);
     }
 
     fn handle_did_close(&mut self, connection: &Connection, params: DidCloseTextDocumentParams) {
         self.hooks.maybe_panic_notification(DID_CLOSE);
         let uri = params.text_document.uri;
         self.documents.close(&uri);
-        if let Err(error) = send_ok_responses(connection, self.semantic_tokens.clear(&uri), empty_response_value()) {
+        self.scheduler.set_open_buckets(self.documents.open_buckets());
+        self.analysis.invalidate_uri(&uri);
+        if let Err(error) =
+            send_ok_responses(connection, self.semantic_token_requests.clear_uri(&uri), empty_response_value())
+        {
             tracing::error!(uri = uri.as_str(), error = %error, "failed to flush semantic token close responses");
+        }
+        if let Err(error) = send_definition_nulls(connection, self.definition_requests.clear_uri(&uri)) {
+            tracing::error!(uri = uri.as_str(), error = %error, "failed to flush definition close responses");
         }
     }
 
     fn handle_cancel_request(&mut self, connection: &Connection, params: CancelParams) -> Result<()> {
         let request_id = request_id_from_cancel(params.id);
-        if self.semantic_tokens.remove_pending_request(&request_id) {
+        if self.semantic_token_requests.remove_pending_request(&request_id) {
             send_error_response(
                 connection,
                 request_id,
                 ErrorCode::RequestCanceled as i32,
                 "semantic token request cancelled",
+            )
+        } else if self.definition_requests.remove_pending_request(&request_id).is_some() {
+            send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "definition request cancelled",
             )
         } else {
             Ok(())
@@ -367,17 +407,15 @@ impl ServerState {
 
     fn handle_worker_event(&mut self, connection: &Connection, event: WorkerEvent) {
         match event {
-            WorkerEvent::Analyzed(DocumentAnalysis { uri, generation, semantic_snapshot }) => {
-                // Worker jobs finish asynchronously, so only the latest
-                // committed generation is allowed to surface as current.
-                if self.documents.generation(&uri) == Some(generation) {
-                    let pending = self.semantic_tokens.store_success(uri.clone(), generation, semantic_snapshot);
-                    if let Some(snapshot) = self.semantic_tokens.cached(&uri, generation)
-                        && let Err(error) =
-                            send_ok_responses(connection, pending, response_value(snapshot.encoded_tokens.as_ref()))
-                    {
-                        tracing::error!(uri = uri.as_str(), error = %error, "failed to send semantic token response");
-                    }
+            WorkerEvent::PackageAnalyzed(PackageAnalysis { uri, generation, key, result }) => {
+                self.analysis.in_flight_packages.remove(&key);
+                if self.documents.generation(&uri) == Some(generation)
+                    && self.documents.package_key(&uri) == Some(key.clone())
+                {
+                    self.analysis.store_package(Arc::clone(&result.package));
+                    self.store_document_view(connection, result.document_view);
+                    self.answer_pending_definitions(connection, &key);
+                    self.enqueue_pending_document_views_for_package(&key);
                     tracing::debug!(
                         uri = uri.as_str(),
                         generation,
@@ -385,24 +423,87 @@ impl ServerState {
                         "worker completed latest document"
                     );
                 } else {
-                    tracing::debug!(uri = uri.as_str(), generation, "dropping stale worker completion");
+                    self.cancel_pending_package_requests(connection, &key, "package analysis was superseded");
+                    tracing::debug!(uri = uri.as_str(), generation, "dropping stale package worker completion");
                 }
             }
-            WorkerEvent::Cancelled { uri, generation } => {
-                tracing::debug!(uri = uri.as_str(), generation, "worker cancelled stale document");
+            WorkerEvent::DocumentViewBuilt(view) => {
+                self.analysis.in_flight_views.remove(&view.key);
+                if self.documents.document_view_key(&view.key.uri) == Some(view.key.clone()) {
+                    self.store_document_view(connection, view);
+                } else {
+                    self.cancel_pending_document_view_requests(
+                        connection,
+                        &view.key,
+                        "semantic token document view was superseded",
+                    );
+                }
             }
-            WorkerEvent::Panicked { uri, generation, report } => {
+            WorkerEvent::PackageCancelled { key, uri, generation } => {
+                self.analysis.in_flight_packages.remove(&key);
+                self.cancel_pending_package_requests(connection, &key, "package analysis was cancelled");
+                tracing::debug!(uri = uri.as_str(), generation, "worker cancelled stale package analysis");
+            }
+            WorkerEvent::DocumentViewCancelled { key } => {
+                self.analysis.in_flight_views.remove(&key);
+                self.cancel_pending_document_view_requests(
+                    connection,
+                    &key,
+                    "semantic token document view was cancelled",
+                );
+                tracing::debug!(
+                    uri = key.uri.as_str(),
+                    generation = key.document_generation,
+                    "worker cancelled stale document view"
+                );
+            }
+            WorkerEvent::PackagePanicked { key, uri, generation, report } => {
                 report.log();
-                if self.documents.generation(&uri) == Some(generation) {
-                    let pending = self.semantic_tokens.store_failure(uri.clone(), generation);
+                self.analysis.in_flight_packages.remove(&key);
+                if self.documents.generation(&uri) == Some(generation)
+                    && self.documents.package_key(&uri) == Some(key.clone())
+                {
+                    self.analysis.store_failed_package(key.clone());
+                    let pending_semantic = self.semantic_token_requests.take_package(&key);
                     if let Err(error) = send_error_responses(
                         connection,
-                        pending,
+                        pending_semantic,
                         INTERNAL_ERROR,
                         "semantic token analysis panicked; see server logs for details",
                     ) {
                         tracing::error!(uri = uri.as_str(), error = %error, "failed to send semantic analysis panic");
                     }
+                    if let Err(error) = send_error_responses(
+                        connection,
+                        self.definition_requests.take_package(&key).into_iter().map(|pending| pending.id).collect(),
+                        INTERNAL_ERROR,
+                        "definition analysis panicked; see server logs for details",
+                    ) {
+                        tracing::error!(uri = uri.as_str(), error = %error, "failed to send definition analysis panic");
+                    }
+                } else {
+                    self.cancel_pending_package_requests(connection, &key, "package analysis was superseded");
+                }
+            }
+            WorkerEvent::DocumentViewPanicked { key, report } => {
+                report.log();
+                self.analysis.in_flight_views.remove(&key);
+                if self.documents.document_view_key(&key.uri) == Some(key.clone()) {
+                    self.analysis.failed_views.insert(key.clone());
+                    if let Err(error) = send_error_responses(
+                        connection,
+                        self.semantic_token_requests.take_key(&key),
+                        INTERNAL_ERROR,
+                        "semantic token document view panicked; see server logs for details",
+                    ) {
+                        tracing::error!(uri = key.uri.as_str(), error = %error, "failed to send document-view panic");
+                    }
+                } else {
+                    self.cancel_pending_document_view_requests(
+                        connection,
+                        &key,
+                        "semantic token document view was superseded",
+                    );
                 }
             }
         }
@@ -415,104 +516,327 @@ impl ServerState {
         params: SemanticTokensParams,
     ) -> Result<()> {
         let uri = params.text_document.uri;
-        let Some(generation) = self.documents.generation(&uri) else {
+        let Some(view_key) = self.documents.document_view_key(&uri) else {
             return send_ok_response(connection, request_id, empty_response_value());
         };
 
-        match self.semantic_tokens.status_or_queue(uri, generation, request_id.clone()) {
-            DocumentRequestStatus::Cached(snapshot) => {
-                send_ok_response(connection, request_id, response_value(snapshot.encoded_tokens.as_ref()))
-            }
-            DocumentRequestStatus::Failed => send_error_response(
+        if let Some(view) = self.analysis.document_view(&view_key) {
+            return send_ok_response(connection, request_id, response_value(view.encoded_tokens.as_ref()));
+        }
+
+        if self.analysis.failed_views.contains(&view_key) || self.analysis.failed_packages.contains(&view_key.package) {
+            return send_error_response(
                 connection,
                 request_id,
                 INTERNAL_ERROR,
                 "semantic token analysis panicked; see server logs for details",
-            ),
-            DocumentRequestStatus::Pending => Ok(()),
+            );
+        }
+
+        self.semantic_token_requests.queue(view_key.clone(), request_id);
+        self.ensure_analysis_for_view(&view_key);
+        Ok(())
+    }
+
+    fn handle_goto_definition(
+        &mut self,
+        connection: &Connection,
+        request_id: RequestId,
+        params: GotoDefinitionParams,
+    ) -> Result<()> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let Some(document) = self.documents.open_document(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(file_path) = document.file_path.clone() else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(offset) = position_to_offset(document.line_index.as_ref(), position) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+        let Some(view_key) = self.documents.document_view_key(&uri) else {
+            return send_ok_response(connection, request_id, Value::Null);
+        };
+
+        let query = DefinitionQuery {
+            uri: uri.clone(),
+            file_path,
+            position,
+            offset,
+            line_index: Arc::clone(&document.line_index),
+            view_key: view_key.clone(),
+            link_support: self.client_definition_link_support,
+        };
+
+        if let Some(package) = self.analysis.packages.get(&view_key.package) {
+            return send_ok_response(
+                connection,
+                request_id,
+                definition_response_value(resolve_definition(&query, package)),
+            );
+        }
+
+        if self.analysis.failed_packages.contains(&view_key.package) {
+            return send_error_response(
+                connection,
+                request_id,
+                INTERNAL_ERROR,
+                "definition analysis panicked; see server logs for details",
+            );
+        }
+
+        if self.definition_requests.queue(query, request_id.clone()) {
+            self.ensure_package_analysis(&view_key.package, &uri);
+            Ok(())
+        } else {
+            send_error_response(
+                connection,
+                request_id,
+                ErrorCode::RequestCanceled as i32,
+                "too many pending definition requests",
+            )
+        }
+    }
+
+    fn ensure_analysis_for_view(&mut self, view_key: &DocumentViewKey) {
+        if let Some(package) = self.analysis.packages.get(&view_key.package).cloned() {
+            self.ensure_document_view(view_key, package);
+        } else {
+            self.ensure_package_analysis(&view_key.package, &view_key.uri);
+        }
+    }
+
+    fn ensure_package_analysis(&mut self, package_key: &PackageAnalysisKey, uri: &Uri) {
+        if self.analysis.in_flight_packages.contains(package_key) || self.analysis.packages.contains_key(package_key) {
+            return;
+        }
+        let Some(snapshot) = self.documents.snapshot_for_package_analysis(uri) else {
+            return;
+        };
+        self.analysis.in_flight_packages.insert(snapshot.package_key.clone());
+        self.scheduler.enqueue_package(snapshot);
+    }
+
+    fn ensure_document_view(&mut self, view_key: &DocumentViewKey, package: Arc<CachedPackageAnalysis>) {
+        if self.analysis.in_flight_views.contains(view_key) || self.analysis.document_view(view_key).is_some() {
+            return;
+        }
+        let Some(snapshot) = self.documents.snapshot_for_document_view(&view_key.uri) else {
+            return;
+        };
+        self.analysis.in_flight_views.insert(snapshot.key.clone());
+        self.scheduler.enqueue_document_view(snapshot, package);
+    }
+
+    fn store_document_view(&mut self, connection: &Connection, view: CachedDocumentView) {
+        let key = view.key.clone();
+        let uri = key.uri.clone();
+        self.analysis.document_views.insert(uri.clone(), view.clone());
+        let pending = self.semantic_token_requests.take_key(&key);
+        if let Err(error) = send_ok_responses(connection, pending, response_value(view.encoded_tokens.as_ref())) {
+            tracing::error!(uri = uri.as_str(), error = %error, "failed to send semantic token response");
+        }
+    }
+
+    fn answer_pending_definitions(&mut self, connection: &Connection, key: &PackageAnalysisKey) {
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        for pending in self.definition_requests.take_package(key) {
+            let value = definition_response_value(resolve_definition(&pending.query, package.as_ref()));
+            if let Err(error) = send_ok_response(connection, pending.id, value) {
+                tracing::error!(error = %error, "failed to send definition response");
+            }
+        }
+    }
+
+    fn enqueue_pending_document_views_for_package(&mut self, key: &PackageAnalysisKey) {
+        let Some(package) = self.analysis.packages.get(key).cloned() else {
+            return;
+        };
+        let keys = self.semantic_token_requests.keys_for_package(key);
+        for view_key in keys {
+            self.ensure_document_view(&view_key, Arc::clone(&package));
+        }
+    }
+
+    fn cancel_pending_package_requests(
+        &mut self,
+        connection: &Connection,
+        key: &PackageAnalysisKey,
+        message: &'static str,
+    ) {
+        if let Err(error) = send_error_responses(
+            connection,
+            self.semantic_token_requests.take_package(key),
+            ErrorCode::RequestCanceled as i32,
+            format!("semantic token {message}"),
+        ) {
+            tracing::error!(error = %error, "failed to cancel semantic token package waiters");
+        }
+
+        let definition_requests =
+            self.definition_requests.take_package(key).into_iter().map(|pending| pending.id).collect();
+        if let Err(error) = send_error_responses(
+            connection,
+            definition_requests,
+            ErrorCode::RequestCanceled as i32,
+            format!("definition {message}"),
+        ) {
+            tracing::error!(error = %error, "failed to cancel definition package waiters");
+        }
+    }
+
+    fn cancel_pending_document_view_requests(
+        &mut self,
+        connection: &Connection,
+        key: &DocumentViewKey,
+        message: &'static str,
+    ) {
+        if let Err(error) = send_error_responses(
+            connection,
+            self.semantic_token_requests.take_key(key),
+            ErrorCode::RequestCanceled as i32,
+            message,
+        ) {
+            tracing::error!(uri = key.uri.as_str(), error = %error, "failed to cancel semantic token view waiters");
         }
     }
 }
 
-impl<T> DocumentRequestState<T> {
-    /// Drop cached success/failure state for one URI after the document changes.
-    fn invalidate(&mut self, uri: &Uri) {
-        self.cached.remove(uri);
-        self.failed.remove(uri);
+impl AnalysisCaches {
+    fn invalidate_uri(&mut self, uri: &Uri) {
+        self.document_views.remove(uri);
+        self.failed_views.retain(|key| &key.uri != uri);
+        self.in_flight_views.retain(|key| &key.uri != uri);
     }
 
-    /// Drop all state for one URI and return any waiters that still need a response.
-    fn clear(&mut self, uri: &Uri) -> Vec<RequestId> {
-        self.invalidate(uri);
-        self.take_pending(uri)
+    fn document_view(&self, key: &DocumentViewKey) -> Option<&CachedDocumentView> {
+        self.document_views.get(&key.uri).filter(|view| &view.key == key)
     }
 
-    /// Return the current-generation state for a request, or queue it as a waiter.
-    fn status_or_queue(&mut self, uri: Uri, generation: u64, request_id: RequestId) -> DocumentRequestStatus<'_, T> {
-        if let Some(cached) = self.cached.get(&uri)
-            && cached.generation == generation
-        {
-            return DocumentRequestStatus::Cached(&cached.value);
+    fn store_package(&mut self, package: Arc<CachedPackageAnalysis>) {
+        self.failed_packages.remove(&package.key);
+        if !self.packages.contains_key(&package.key) {
+            self.package_order.push_back(package.key.clone());
         }
-
-        if let Some(failed) = self.failed.get(&uri)
-            && failed.generation == generation
-        {
-            return DocumentRequestStatus::Failed;
-        }
-
-        // Hold the request open until analysis for this generation finishes,
-        // then fan the single result out to every waiter on the same URI.
-        self.pending_by_uri.entry(uri.clone()).or_default().push(request_id.clone());
-        self.pending_owner.insert(request_id, uri);
-        DocumentRequestStatus::Pending
-    }
-
-    /// Cache a successful result and return every pending waiter for that URI.
-    fn store_success(&mut self, uri: Uri, generation: u64, value: T) -> Vec<RequestId> {
-        self.failed.remove(&uri);
-        self.cached.insert(uri.clone(), CachedDocumentResult { generation, value });
-        self.take_pending(&uri)
-    }
-
-    /// Cache a generation-scoped failure and return every pending waiter for that URI.
-    fn store_failure(&mut self, uri: Uri, generation: u64) -> Vec<RequestId> {
-        self.cached.remove(&uri);
-        self.failed.insert(uri.clone(), FailedDocumentResult { generation });
-        self.take_pending(&uri)
-    }
-
-    /// Return the cached success payload for one URI/generation pair.
-    fn cached(&self, uri: &Uri, generation: u64) -> Option<&T> {
-        self.cached.get(uri).filter(|entry| entry.generation == generation).map(|entry| &entry.value)
-    }
-
-    /// Remove one queued waiter by request ID.
-    fn remove_pending_request(&mut self, request_id: &RequestId) -> bool {
-        let Some(owner) = self.pending_owner.remove(request_id) else {
-            return false;
-        };
-
-        if let Some(queue) = self.pending_by_uri.get_mut(&owner) {
-            queue.retain(|pending| pending != request_id);
-            if queue.is_empty() {
-                self.pending_by_uri.remove(&owner);
+        self.packages.insert(package.key.clone(), package);
+        while self.package_order.len() > MAX_PACKAGE_CACHE_ENTRIES {
+            if let Some(oldest) = self.package_order.pop_front() {
+                self.packages.remove(&oldest);
+                self.failed_packages.remove(&oldest);
             }
         }
+    }
 
+    fn store_failed_package(&mut self, key: PackageAnalysisKey) {
+        self.failed_packages.retain(|failed| failed.bucket != key.bucket);
+        self.failed_packages.insert(key);
+    }
+}
+
+impl SemanticTokenRequestState {
+    fn queue(&mut self, key: DocumentViewKey, request_id: RequestId) {
+        self.pending_by_key.entry(key.clone()).or_default().push(request_id.clone());
+        self.pending_owner.insert(request_id, key);
+    }
+
+    fn remove_pending_request(&mut self, request_id: &RequestId) -> bool {
+        let Some(key) = self.pending_owner.remove(request_id) else {
+            return false;
+        };
+        if let Some(queue) = self.pending_by_key.get_mut(&key) {
+            queue.retain(|pending| pending != request_id);
+            if queue.is_empty() {
+                self.pending_by_key.remove(&key);
+            }
+        }
         true
     }
 
-    /// Drain every queued waiter for one URI.
-    fn take_pending(&mut self, uri: &Uri) -> Vec<RequestId> {
-        let Some(requests) = self.pending_by_uri.remove(uri) else {
+    fn clear_uri(&mut self, uri: &Uri) -> Vec<RequestId> {
+        let keys = self.pending_by_key.keys().filter(|key| &key.uri == uri).cloned().collect::<Vec<_>>();
+        keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
+    }
+
+    fn take_key(&mut self, key: &DocumentViewKey) -> Vec<RequestId> {
+        let Some(requests) = self.pending_by_key.remove(key) else {
             return Vec::new();
         };
-
         for request_id in &requests {
             self.pending_owner.remove(request_id);
         }
+        requests
+    }
 
+    fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<RequestId> {
+        let keys = self.keys_for_package(package);
+        keys.into_iter().flat_map(|key| self.take_key(&key)).collect()
+    }
+
+    fn keys_for_package(&self, package: &PackageAnalysisKey) -> Vec<DocumentViewKey> {
+        self.pending_by_key.keys().filter(|key| &key.package == package).cloned().collect()
+    }
+}
+
+impl DefinitionRequestState {
+    fn queue(&mut self, query: DefinitionQuery, request_id: RequestId) -> bool {
+        if self.pending_owner.len() >= MAX_PENDING_DEFINITIONS {
+            return false;
+        }
+        let package = query.view_key.package.clone();
+        let queue = self.pending_by_package.entry(package.clone()).or_default();
+        if queue.len() >= MAX_PENDING_DEFINITIONS_PER_KEY {
+            return false;
+        }
+        queue.push(PendingDefinitionRequest { id: request_id.clone(), query });
+        self.pending_owner.insert(request_id, package);
+        true
+    }
+
+    fn remove_pending_request(&mut self, request_id: &RequestId) -> Option<PendingDefinitionRequest> {
+        let package = self.pending_owner.remove(request_id)?;
+        let queue = self.pending_by_package.get_mut(&package)?;
+        let index = queue.iter().position(|pending| &pending.id == request_id)?;
+        let pending = queue.remove(index);
+        if queue.is_empty() {
+            self.pending_by_package.remove(&package);
+        }
+        Some(pending)
+    }
+
+    fn clear_uri(&mut self, uri: &Uri) -> Vec<PendingDefinitionRequest> {
+        let packages = self.pending_by_package.keys().cloned().collect::<Vec<_>>();
+        let mut cleared = Vec::new();
+        for package in packages {
+            let Some(queue) = self.pending_by_package.get_mut(&package) else {
+                continue;
+            };
+            let mut index = 0;
+            while index < queue.len() {
+                if &queue[index].query.uri == uri {
+                    let pending = queue.remove(index);
+                    self.pending_owner.remove(&pending.id);
+                    cleared.push(pending);
+                } else {
+                    index += 1;
+                }
+            }
+            if queue.is_empty() {
+                self.pending_by_package.remove(&package);
+            }
+        }
+        cleared
+    }
+
+    fn take_package(&mut self, package: &PackageAnalysisKey) -> Vec<PendingDefinitionRequest> {
+        let Some(requests) = self.pending_by_package.remove(package) else {
+            return Vec::new();
+        };
+        for request in &requests {
+            self.pending_owner.remove(&request.id);
+        }
         requests
     }
 }
@@ -546,8 +870,19 @@ fn server_capabilities() -> ServerCapabilities {
             save: None,
         })),
         semantic_tokens_provider: Some(semantic_tokens_capability()),
+        definition_provider: Some(OneOf::Left(true)),
         ..Default::default()
     }
+}
+
+fn client_supports_definition_links(params: &InitializeParams) -> bool {
+    params
+        .capabilities
+        .text_document
+        .as_ref()
+        .and_then(|text_document| text_document.definition.as_ref())
+        .and_then(|definition| definition.link_support)
+        .unwrap_or(false)
 }
 
 fn extract_full_sync_text(changes: Vec<TextDocumentContentChangeEvent>) -> Option<String> {
@@ -592,6 +927,13 @@ fn send_ok_responses(connection: &Connection, request_ids: Vec<RequestId>, resul
         send_ok_response(connection, request_id, result.clone())?;
     }
 
+    Ok(())
+}
+
+fn send_definition_nulls(connection: &Connection, requests: Vec<PendingDefinitionRequest>) -> Result<()> {
+    for request in requests {
+        send_ok_response(connection, request.id, Value::Null)?;
+    }
     Ok(())
 }
 
@@ -662,7 +1004,7 @@ mod tests {
         VersionedTextDocumentIdentifier,
     };
     use serde_json::{Value, json};
-    use std::{fs, path::Path, process::ExitCode, sync::Arc, thread, time::Duration};
+    use std::{fs, path::Path, process::ExitCode, thread, time::Duration};
     use tempfile::tempdir;
 
     fn spawn_server(hooks: TestHooks) -> (Connection, thread::JoinHandle<anyhow::Result<ExitCode>>) {
@@ -706,14 +1048,6 @@ mod tests {
         }
     }
 
-    fn empty_semantic_snapshot() -> crate::semantics::SemanticSnapshot {
-        crate::semantics::SemanticSnapshot {
-            encoded_tokens: Arc::<[u32]>::from([]),
-            index: Arc::new(crate::semantics::SemanticIndex::default()),
-            source: crate::semantics::SemanticSource::SyntaxOnly,
-        }
-    }
-
     fn semantic_tokens_params(uri: Uri) -> SemanticTokensParams {
         SemanticTokensParams {
             work_done_progress_params: Default::default(),
@@ -730,7 +1064,10 @@ mod tests {
             documents: crate::document_store::DocumentStore::default(),
             project_model: crate::project_model::ProjectModel::default(),
             scheduler: crate::scheduler::Scheduler::new(false),
-            semantic_tokens: super::DocumentRequestState::default(),
+            analysis: super::AnalysisCaches::default(),
+            semantic_token_requests: super::SemanticTokenRequestState::default(),
+            definition_requests: super::DefinitionRequestState::default(),
+            client_definition_link_support: false,
             hooks: TestHooks::default(),
         }
     }
@@ -744,7 +1081,7 @@ mod tests {
             None,
             None,
         ));
-        state.semantic_tokens.invalidate(uri);
+        state.analysis.invalidate_uri(uri);
     }
 
     fn initialize(client: &Connection) {
@@ -839,7 +1176,32 @@ mod tests {
         let error = response.error.expect("cancelled response error");
         assert_eq!(error.code, ErrorCode::RequestCanceled as i32);
         assert!(error.message.contains("cancelled"));
-        assert!(state.semantic_tokens.pending_by_uri.is_empty());
+        assert!(state.semantic_token_requests.pending_by_key.is_empty());
+        state.scheduler.shutdown();
+    }
+
+    #[test]
+    fn cancelled_package_analysis_fails_pending_waiters() {
+        let (server, client) = Connection::memory();
+        let mut state = test_state();
+        let uri: Uri = "untitled:main.leo".parse().expect("uri");
+
+        open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let key = state.documents.document_view_key(&uri).expect("document view key");
+        state.semantic_token_requests.queue(key.clone(), 2.into());
+
+        state.handle_worker_event(&server, crate::scheduler::WorkerEvent::PackageCancelled {
+            key: key.package,
+            uri: uri.clone(),
+            generation: 1,
+        });
+
+        let response = recv_response(&client);
+        assert_eq!(response.id, 2.into());
+        let error = response.error.expect("cancelled response error");
+        assert_eq!(error.code, ErrorCode::RequestCanceled as i32);
+        assert!(error.message.contains("cancelled"));
+        assert!(state.semantic_token_requests.pending_by_key.is_empty());
         state.scheduler.shutdown();
     }
 
@@ -859,7 +1221,9 @@ mod tests {
             panic!("boom");
         })
         .expect_err("panic report");
-        state.handle_worker_event(&server, crate::scheduler::WorkerEvent::Panicked {
+        let key = state.documents.package_key(&uri).expect("package key");
+        state.handle_worker_event(&server, crate::scheduler::WorkerEvent::PackagePanicked {
+            key,
             uri: uri.clone(),
             generation: 1,
             report: panic_report,
@@ -876,7 +1240,7 @@ mod tests {
         let second = recv_response(&client);
         assert_eq!(second.id, 3.into());
         assert_eq!(second.error.expect("repeat panic error").code, super::INTERNAL_ERROR);
-        assert!(state.semantic_tokens.pending_by_uri.is_empty());
+        assert!(state.semantic_token_requests.pending_by_key.is_empty());
         state.scheduler.shutdown();
     }
 
@@ -887,13 +1251,14 @@ mod tests {
         let uri: Uri = "untitled:main.leo".parse().expect("uri");
 
         open_unmanaged_document(&mut state, &uri, 1, "program test.aleo {}\n");
+        let stale_key = state.documents.package_key(&uri).expect("initial package key");
 
         let changed = state
             .documents
             .prepare_full_change(&uri, 2, "program test.aleo { fn main() {} }\n".to_owned(), None, None)
             .expect("prepared change");
         state.documents.commit_change(changed);
-        state.semantic_tokens.invalidate(&uri);
+        state.analysis.invalidate_uri(&uri);
 
         state
             .handle_semantic_tokens_full(&server, 2.into(), semantic_tokens_params(uri.clone()))
@@ -903,26 +1268,14 @@ mod tests {
             panic!("stale boom");
         })
         .expect_err("panic report");
-        state.handle_worker_event(&server, crate::scheduler::WorkerEvent::Panicked {
+        state.handle_worker_event(&server, crate::scheduler::WorkerEvent::PackagePanicked {
+            key: stale_key,
             uri: uri.clone(),
             generation: 1,
             report: panic_report,
         });
 
         assert!(client.receiver.recv_timeout(Duration::from_millis(50)).is_err(), "stale panic should not respond");
-
-        state.handle_worker_event(
-            &server,
-            crate::scheduler::WorkerEvent::Analyzed(crate::scheduler::DocumentAnalysis {
-                uri: uri.clone(),
-                generation: 2,
-                semantic_snapshot: empty_semantic_snapshot(),
-            }),
-        );
-
-        let response = recv_response(&client);
-        assert_eq!(response.id, 2.into());
-        assert_eq!(response.result, Some(crate::features::semantic_tokens::empty_response_value()));
         state.scheduler.shutdown();
     }
 
@@ -943,7 +1296,10 @@ mod tests {
             documents: crate::document_store::DocumentStore::default(),
             project_model: crate::project_model::ProjectModel::default(),
             scheduler: crate::scheduler::Scheduler::new(false),
-            semantic_tokens: super::DocumentRequestState::default(),
+            analysis: super::AnalysisCaches::default(),
+            semantic_token_requests: super::SemanticTokenRequestState::default(),
+            definition_requests: super::DefinitionRequestState::default(),
+            client_definition_link_support: false,
             hooks: TestHooks::default(),
         };
 

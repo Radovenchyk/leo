@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU General Public License
 // along with the Leo library. If not, see <https://www.gnu.org/licenses/>.
 
+#![allow(clippy::mutable_key_type)]
+
 //! Compiler-backed semantic analysis for `leo-lsp`.
 //!
 //! The worker always produces a syntax-derived token stream so highlighting can
@@ -23,10 +25,12 @@
 //! symbol identities and more accurate token kinds.
 
 use crate::{
-    document_store::DocumentSnapshot,
+    document_store::{AnalysisBucket, DocumentSnapshot, DocumentViewSnapshot, OpenFileOverlay},
     features::semantic_tokens::encode_tokens,
     project_model::ProjectContext,
     semantics::{
+        CachedDocumentView,
+        CachedPackageAnalysis,
         FileRange,
         OccurrenceRole,
         SemanticIndex,
@@ -34,6 +38,7 @@ use crate::{
         SemanticSnapshot,
         SemanticSource,
         SemanticTokenOccurrence,
+        SourceFingerprint,
         SymbolIdentity,
         SymbolOccurrence,
         merge_occurrences,
@@ -82,19 +87,29 @@ use leo_passes::{SymbolTable, TypeTable, VariableType};
 use leo_span::{
     Symbol,
     create_session_if_not_set_then,
-    file_source::{DiskFileSource, OverlayFileSource},
+    file_source::{DiskFileSource, FileSource},
     source_map::FileName,
     with_session_globals,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::Metadata,
     hash::{DefaultHasher, Hash, Hasher},
+    io,
     path::{Path as StdPath, PathBuf},
     rc::Rc,
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, Mutex, atomic::Ordering},
     time::UNIX_EPOCH,
 };
+
+/// Worker result for a package-analysis job.
+#[derive(Debug, Clone)]
+pub struct PackageWorkerAnalysis {
+    /// Shared package analysis cached by package key on the routing thread.
+    pub package: Arc<CachedPackageAnalysis>,
+    /// Encoded semantic-token view for the document that triggered the job.
+    pub document_view: CachedDocumentView,
+}
 
 /// Worker-local cache of package dependency stubs.
 #[derive(Debug, Default)]
@@ -139,58 +154,130 @@ enum WatchedPathStamp {
     Directory { modified_nanos: u128 },
 }
 
-/// Build the latest semantic snapshot for one committed document generation.
+/// Compiler occurrences plus source fingerprints captured by the file source.
+#[derive(Debug)]
+struct CompilerOutput {
+    occurrences: Vec<SymbolOccurrence>,
+    fingerprints: HashMap<PathBuf, SourceFingerprint>,
+}
+
+/// Build the latest package analysis plus the trigger document's token view.
 ///
 /// Syntax analysis always runs first so the server can return a best-effort
 /// token stream even when package discovery, dependency loading, or compiler
 /// analysis fail. Compiler-backed occurrences then replace matching syntax
-/// ranges when available so later features can reuse a richer semantic index.
-pub fn analyze_snapshot(snapshot: &DocumentSnapshot, package_cache: &mut PackageAnalysisCache) -> SemanticSnapshot {
+/// ranges when available so navigation reuses the same semantic truth as
+/// highlighting.
+pub fn analyze_package_snapshot(
+    snapshot: &DocumentSnapshot,
+    package_cache: &mut PackageAnalysisCache,
+) -> PackageWorkerAnalysis {
     let syntax = syntax_semantics::collect(snapshot);
     if snapshot_is_cancelled(snapshot) {
-        return semantic_snapshot(snapshot, syntax.occurrences, syntax.tokens, SemanticSource::SyntaxOnly);
+        return package_analysis(
+            snapshot,
+            syntax.occurrences,
+            syntax.tokens,
+            SemanticSource::SyntaxOnly,
+            HashMap::new(),
+        );
     }
 
     let compiler_occurrences = compiler_occurrences(snapshot, package_cache);
     if snapshot_is_cancelled(snapshot) {
-        return semantic_snapshot(snapshot, syntax.occurrences, syntax.tokens, SemanticSource::SyntaxOnly);
+        return package_analysis(
+            snapshot,
+            syntax.occurrences,
+            syntax.tokens,
+            SemanticSource::SyntaxOnly,
+            HashMap::new(),
+        );
     }
 
-    let (occurrences, source) = match compiler_occurrences {
-        Some(compiler_occurrences) => {
-            (merge_occurrences(syntax.occurrences, compiler_occurrences), SemanticSource::CompilerEnhanced)
+    let (occurrences, source, fingerprints) = match compiler_occurrences {
+        Some(CompilerOutput { occurrences, fingerprints }) => {
+            (merge_occurrences(syntax.occurrences, occurrences), SemanticSource::CompilerEnhanced, fingerprints)
         }
-        None => (syntax.occurrences, SemanticSource::SyntaxOnly),
+        None => (syntax.occurrences, SemanticSource::SyntaxOnly, HashMap::new()),
     };
 
-    semantic_snapshot(snapshot, occurrences, syntax.tokens, source)
+    package_analysis(snapshot, occurrences, syntax.tokens, source, fingerprints)
 }
 
-/// Encode one semantic occurrence set into the cached snapshot returned to the main thread.
-fn semantic_snapshot(
+/// Compatibility helper retained for PR 2 tests and callers.
+#[allow(dead_code)]
+pub fn analyze_snapshot(snapshot: &DocumentSnapshot, package_cache: &mut PackageAnalysisCache) -> SemanticSnapshot {
+    let analysis = analyze_package_snapshot(snapshot, package_cache);
+    SemanticSnapshot {
+        encoded_tokens: analysis.document_view.encoded_tokens,
+        index: Arc::clone(&analysis.package.index),
+        source: analysis.package.source,
+    }
+}
+
+/// Build a document token view from a cached package analysis.
+pub fn build_document_view(snapshot: &DocumentViewSnapshot, package: Arc<CachedPackageAnalysis>) -> CachedDocumentView {
+    let syntax = syntax_semantics::collect_view(snapshot);
+    let package_tokens = snapshot
+        .file_path
+        .as_deref()
+        .map(|path| package.index.token_occurrences_for_file(path.as_ref()))
+        .unwrap_or_default();
+    let tokens = semantic_token_occurrences(&package_tokens, syntax.occurrences, syntax.tokens);
+    let encoded_tokens = encode_tokens(&tokens, snapshot.file_path.as_deref(), snapshot.line_index.as_ref());
+    CachedDocumentView { key: snapshot.key.clone(), encoded_tokens }
+}
+
+fn package_analysis(
     snapshot: &DocumentSnapshot,
     occurrences: Vec<SymbolOccurrence>,
     lexical_tokens: Vec<SemanticTokenOccurrence>,
     source: SemanticSource,
-) -> SemanticSnapshot {
-    let semantic_tokens = semantic_token_occurrences(&occurrences, lexical_tokens);
-    let encoded_tokens = encode_tokens(&semantic_tokens, snapshot.file_path.as_deref(), snapshot.line_index.as_ref());
+    recorded_fingerprints: HashMap<PathBuf, SourceFingerprint>,
+) -> PackageWorkerAnalysis {
+    let (index, analyzed_files) = SemanticIndex::build(
+        &occurrences,
+        |path| {
+            recorded_fingerprints
+                .get(path)
+                .cloned()
+                .or_else(|| open_buffer_fingerprint(snapshot.open_overlays.as_ref(), path))
+                .or_else(|| disk_fingerprint(path))
+                .unwrap_or(SourceFingerprint::Volatile)
+        },
+        |path| open_line_index(snapshot.open_overlays.as_ref(), path),
+    );
+    let index = Arc::new(index);
+    let package = Arc::new(CachedPackageAnalysis {
+        key: snapshot.package_key.clone(),
+        index: Arc::clone(&index),
+        analyzed_files: Arc::new(analyzed_files),
+        source,
+    });
 
-    SemanticSnapshot { encoded_tokens, index: Arc::new(SemanticIndex { occurrences }), source }
+    let package_tokens =
+        snapshot.file_path.as_deref().map(|path| index.token_occurrences_for_file(path.as_ref())).unwrap_or_default();
+    let semantic_tokens = semantic_token_occurrences(&package_tokens, Vec::new(), lexical_tokens);
+    let encoded_tokens = encode_tokens(&semantic_tokens, snapshot.file_path.as_deref(), snapshot.line_index.as_ref());
+    let document_view = CachedDocumentView { key: snapshot.view_key.clone(), encoded_tokens };
+
+    PackageWorkerAnalysis { package, document_view }
 }
 
 /// Merge symbol occurrences with highlighting-only lexical tokens for encoding.
 fn semantic_token_occurrences(
-    occurrences: &[SymbolOccurrence],
+    package_tokens: &[SemanticTokenOccurrence],
+    syntax_occurrences: Vec<SymbolOccurrence>,
     mut lexical_tokens: Vec<SemanticTokenOccurrence>,
 ) -> Vec<SemanticTokenOccurrence> {
-    let mut tokens = Vec::with_capacity(occurrences.len() + lexical_tokens.len());
-    tokens.extend(occurrences.iter().map(SemanticTokenOccurrence::from_symbol));
+    let mut tokens = Vec::with_capacity(package_tokens.len() + syntax_occurrences.len() + lexical_tokens.len());
+    tokens.extend(package_tokens.iter().cloned());
+    tokens.extend(syntax_occurrences.iter().map(SemanticTokenOccurrence::from_symbol));
     tokens.append(&mut lexical_tokens);
     sort_token_occurrences(&mut tokens);
 
-    // Symbol tokens are inserted before lexical tokens, so exact range ties keep
-    // the navigation-grade semantic classification.
+    // Package tokens are inserted before syntax and lexical tokens, so exact
+    // range ties keep navigation-grade compiler classifications.
     tokens.dedup_by(|left, right| left.range == right.range);
     tokens
 }
@@ -202,14 +289,12 @@ fn semantic_token_occurrences(
 fn compiler_occurrences(
     snapshot: &DocumentSnapshot,
     package_cache: &mut PackageAnalysisCache,
-) -> Option<Vec<SymbolOccurrence>> {
+) -> Option<CompilerOutput> {
     if snapshot_is_cancelled(snapshot) {
         return None;
     }
 
-    let (file_path, project) = compiler_inputs(snapshot)?;
-    let overlay_path = file_path.as_ref().clone();
-    let overlay_text = snapshot.text.to_string();
+    let (_file_path, project) = compiler_inputs(snapshot)?;
     let project = Arc::clone(project);
 
     let result = create_session_if_not_set_then(|_| {
@@ -224,9 +309,9 @@ fn compiler_occurrences(
             error
         })?;
 
-        // Run the compiler against the unsaved editor buffer while reading all
-        // other package files from disk.
-        let overlay_source = OverlayFileSource::new(overlay_path, overlay_text, &DiskFileSource);
+        // Run the compiler against every open same-package editor buffer while
+        // recording fingerprints for disk files at the exact read boundary.
+        let file_source = RecordingFileSource::new(Arc::clone(&snapshot.open_overlays));
         let mut compiler = Compiler::new(
             Some(project.program_name.to_string()),
             false,
@@ -242,18 +327,21 @@ fn compiler_occurrences(
             .analyze_frontend_from_directory_with_file_source_and_check(
                 project.entry_file.as_ref(),
                 project.source_directory.as_ref(),
-                &overlay_source,
+                &file_source,
                 || check_snapshot_current(snapshot),
             )
             .map_err(|error| error.to_string())?;
 
         let FrontendAnalysis { ast, symbol_table, type_table } = frontend;
         check_snapshot_current(snapshot).map_err(|error| error.to_string())?;
-        Ok::<_, String>(CompilerSemanticCollector::new(symbol_table, type_table).collect(ast))
+        Ok::<_, String>(CompilerOutput {
+            occurrences: CompilerSemanticCollector::new(symbol_table, type_table).collect(ast),
+            fingerprints: file_source.fingerprints(),
+        })
     });
 
     match result {
-        Ok(occurrences) => Some(occurrences),
+        Ok(output) => Some(output),
         Err(error) => {
             tracing::debug!(uri = snapshot.uri.as_str(), error, "compiler semantic analysis unavailable; falling back");
             None
@@ -271,7 +359,117 @@ fn compiler_inputs(snapshot: &DocumentSnapshot) -> Option<(&Arc<PathBuf>, &Arc<P
     file_path.starts_with(project.source_directory.as_ref()).then_some((file_path, project))
 }
 
+/// File source that serves all open same-package buffers and records read fingerprints.
+struct RecordingFileSource {
+    overlays: Arc<[OpenFileOverlay]>,
+    fingerprints: Mutex<HashMap<PathBuf, SourceFingerprint>>,
+}
+
+impl RecordingFileSource {
+    fn new(overlays: Arc<[OpenFileOverlay]>) -> Self {
+        Self { overlays, fingerprints: Mutex::new(HashMap::new()) }
+    }
+
+    fn fingerprints(&self) -> HashMap<PathBuf, SourceFingerprint> {
+        self.fingerprints.lock().expect("recording file-source mutex poisoned").clone()
+    }
+
+    fn record(&self, path: &StdPath, fingerprint: SourceFingerprint) {
+        self.fingerprints.lock().expect("recording file-source mutex poisoned").insert(path.to_path_buf(), fingerprint);
+    }
+}
+
+impl FileSource for RecordingFileSource {
+    fn read_file(&self, path: &StdPath) -> io::Result<String> {
+        if let Some(overlay) = self.overlays.iter().find(|overlay| overlay.path.as_ref() == path) {
+            let text = overlay.text.to_string();
+            self.record(path, open_overlay_fingerprint(overlay));
+            return Ok(text);
+        }
+
+        let before = std::fs::metadata(path).ok().and_then(|metadata| disk_stamp(&metadata));
+        let contents = std::fs::read_to_string(path)?;
+        let after = std::fs::metadata(path).ok().and_then(|metadata| disk_stamp(&metadata));
+        let fingerprint = match (before, after) {
+            (Some(before), Some(after)) if before == after => SourceFingerprint::Disk {
+                modified_nanos: Some(after.modified_nanos),
+                len: after.len,
+                content_hash: content_hash(contents.as_str()),
+            },
+            _ => SourceFingerprint::Volatile,
+        };
+        self.record(path, fingerprint);
+        Ok(contents)
+    }
+
+    fn list_leo_files(&self, dir: &StdPath, exclude: &StdPath) -> io::Result<Vec<PathBuf>> {
+        let mut files = DiskFileSource.list_leo_files(dir, exclude)?;
+        for overlay in self.overlays.iter() {
+            if overlay.path.starts_with(dir)
+                && overlay.path.extension().is_some_and(|extension| extension == "leo")
+                && overlay.path.as_ref() != exclude
+                && !files.iter().any(|path| path == overlay.path.as_ref())
+            {
+                files.push(overlay.path.as_ref().clone());
+            }
+        }
+        files.sort();
+        Ok(files)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskStamp {
+    len: u64,
+    modified_nanos: u128,
+}
+
+fn disk_stamp(metadata: &Metadata) -> Option<DiskStamp> {
+    Some(DiskStamp { len: metadata.len(), modified_nanos: metadata_modified_nanos(metadata)? })
+}
+
+fn open_overlay_fingerprint(overlay: &OpenFileOverlay) -> SourceFingerprint {
+    SourceFingerprint::OpenBuffer {
+        uri: overlay.uri.clone(),
+        generation: overlay.generation,
+        content_hash: content_hash(overlay.text.as_ref()),
+    }
+}
+
+fn open_buffer_fingerprint(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<SourceFingerprint> {
+    overlays.iter().find(|overlay| overlay.path.as_ref() == path).map(open_overlay_fingerprint)
+}
+
+fn open_line_index(overlays: &[OpenFileOverlay], path: &StdPath) -> Option<Arc<line_index::LineIndex>> {
+    overlays.iter().find(|overlay| overlay.path.as_ref() == path).map(|overlay| Arc::clone(&overlay.line_index))
+}
+
+fn disk_fingerprint(path: &StdPath) -> Option<SourceFingerprint> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let stamp = std::fs::metadata(path).ok().and_then(|metadata| disk_stamp(&metadata))?;
+    Some(SourceFingerprint::Disk {
+        modified_nanos: Some(stamp.modified_nanos),
+        len: stamp.len,
+        content_hash: content_hash(contents.as_str()),
+    })
+}
+
+fn content_hash(contents: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    contents.hash(&mut hasher);
+    hasher.finish()
+}
+
 impl PackageAnalysisCache {
+    /// Drop worker-local package stub entries that no longer have open documents.
+    pub fn retain_open_buckets(&mut self, open_buckets: &HashSet<AnalysisBucket>) {
+        self.entries.retain(|package_root, _| {
+            open_buckets
+                .iter()
+                .any(|bucket| matches!(bucket, AnalysisBucket::ManagedPackage { package_root: root } if root.as_ref() == package_root))
+        });
+    }
+
     /// Return cached import stubs for the project, reloading them whenever the
     /// watched manifest or source metadata changes.
     fn import_stubs_for(&mut self, project: &ProjectContext) -> Result<Arc<IndexMap<Symbol, leo_ast::Stub>>, String> {
@@ -507,9 +705,8 @@ impl<'a> CompilerSemanticCollector<'a> {
             self.add_namespace_occurrence(first, OccurrenceRole::Reference);
         }
 
-        let Some(location) = path.try_global_location().cloned() else {
-            return;
-        };
+        let location =
+            path.try_global_location().cloned().unwrap_or_else(|| self.current_item_location(path.identifier().name));
         let Some(range) = span_to_file_range(path.identifier().span) else {
             return;
         };
@@ -651,9 +848,11 @@ impl<'a> AstVisitor for CompilerSemanticCollector<'a> {
         // Non-global paths only participate in semantic indexing if they can be
         // matched back to a currently bound lexical declaration.
         let Some(symbol) = input.try_local_symbol() else {
+            self.visit_global_path(input);
             return;
         };
         let Some(binding) = self.local_scopes.iter().rev().find_map(|scope| scope.get(&symbol)).cloned() else {
+            self.visit_global_path(input);
             return;
         };
         let Some(range) = span_to_file_range(input.identifier().span) else {
@@ -1169,22 +1368,15 @@ fn collect_leo_files(dir: &StdPath, files: &mut Vec<PathBuf>) -> bool {
 mod tests {
     use super::{PackageAnalysisCache, analyze_snapshot};
     use crate::{
-        document_store::DocumentSnapshot,
+        document_store::{DocumentSnapshot, DocumentStore},
         project_model::ProjectModel,
-        semantics::{OccurrenceRole, SemanticSource, SymbolIdentity},
+        semantics::{OccurrenceRole, SemanticSource},
     };
     use leo_ast::NetworkName;
     use leo_compiler::load_import_stubs_for_package;
-    use line_index::LineIndex;
     use lsp_types::Uri;
     use serde_json::json;
-    use std::{
-        fs,
-        path::Path,
-        sync::{Arc, atomic::AtomicU64},
-        thread,
-        time::Duration,
-    };
+    use std::{fs, path::Path, sync::Arc, thread, time::Duration};
     use tempfile::tempdir;
 
     fn file_uri(path: &Path) -> Uri {
@@ -1228,17 +1420,8 @@ mod tests {
         let uri = file_uri(path);
         let mut projects = ProjectModel::default();
         let (file_path, project) = projects.resolve_document_context(&uri);
-
-        DocumentSnapshot {
-            uri,
-            text: Arc::from(text),
-            line_index: Arc::new(LineIndex::new(text)),
-            version: 1,
-            generation: 1,
-            file_path,
-            project,
-            cancel_token: Arc::new(AtomicU64::new(1)),
-        }
+        let mut documents = DocumentStore::default();
+        documents.commit_open(documents.prepare_open(uri, "leo".to_owned(), 1, text.to_owned(), file_path, project))
     }
 
     #[test]
@@ -1360,21 +1543,15 @@ mod tests {
             .occurrences
             .iter()
             .filter(|occurrence| {
-                occurrence.range.path.as_ref() == &main_path
+                semantic_snapshot.index.files[occurrence.range.file as usize].as_ref() == &main_path
                     && &source[occurrence.range.start as usize..occurrence.range.end as usize] == "LIMIT"
             })
             .collect::<Vec<_>>();
         assert_eq!(occurrences.len(), 2);
+        assert!(occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
         assert!(occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Declaration));
         assert!(occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Reference));
-
-        let identities = occurrences.iter().map(|occurrence| &occurrence.identity).collect::<Vec<_>>();
-        match (&identities[0], &identities[1]) {
-            (SymbolIdentity::GlobalItem { location: left, .. }, SymbolIdentity::GlobalItem { location: right, .. }) => {
-                assert_eq!(left, right)
-            }
-            other => panic!("expected shared global identities, got {other:?}"),
-        }
+        assert!(occurrences.iter().all(|occurrence| occurrence.key == occurrences[0].key));
     }
 
     #[test]
@@ -1404,22 +1581,14 @@ mod tests {
             .occurrences
             .iter()
             .filter(|occurrence| {
-                occurrence.range.path.as_ref() == &main_path
+                semantic_snapshot.index.files[occurrence.range.file as usize].as_ref() == &main_path
                     && &source[occurrence.range.start as usize..occurrence.range.end as usize] == "x"
             })
             .collect::<Vec<_>>();
         assert_eq!(x_occurrences.len(), 3);
 
-        let owners = x_occurrences
-            .iter()
-            .map(|occurrence| match &occurrence.identity {
-                SymbolIdentity::Member { owner, .. } => owner.clone(),
-                other => panic!("expected member identity, got {other:?}"),
-            })
-            .collect::<Vec<_>>();
-
-        assert!(owners.iter().all(|owner| owner.is_some()));
-        assert!(owners.windows(2).all(|pair| pair[0] == pair[1]));
+        assert!(x_occurrences.iter().all(|occurrence| occurrence.key_id().is_some()));
+        assert!(x_occurrences.iter().all(|occurrence| occurrence.key == x_occurrences[0].key));
         assert!(x_occurrences.iter().any(|occurrence| occurrence.role == OccurrenceRole::Declaration));
         assert_eq!(x_occurrences.iter().filter(|occurrence| occurrence.role == OccurrenceRole::Reference).count(), 2);
     }

@@ -116,6 +116,41 @@ pub(crate) fn uri_to_file_path(uri: &Uri) -> Option<PathBuf> {
     }
 }
 
+/// Convert a native filesystem path into an LSP `file:` URI.
+///
+/// The helper keeps URI construction centralized so editor responses do not
+/// depend on hand-built `file://{path}` strings. It canonicalizes paths when
+/// possible, preserves unresolved paths when necessary, and percent-encodes
+/// bytes that are not safe in a URI path.
+pub(crate) fn path_to_file_uri(path: &Path) -> Option<Uri> {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+
+    #[cfg(target_os = "windows")]
+    let raw = {
+        let display = path.display().to_string();
+        let display = display.strip_prefix(r"\\?\").unwrap_or(display.as_str());
+        format!("/{}", display.replace('\\', "/"))
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let raw = path.display().to_string();
+
+    format!("file://{}", percent_encode_path(&raw)).parse().ok()
+}
+
+fn percent_encode_path(path: &str) -> String {
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' | b':') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
+}
+
 /// Find the nearest package root that owns the given document path.
 fn find_package_root(path: &Path) -> Option<PathBuf> {
     let start = if path.is_dir() { Some(path) } else { path.parent() }?;
